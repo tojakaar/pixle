@@ -14,6 +14,7 @@ import "./App.css";
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const openGenerationRef = useRef(0);
   const [source, setSource] = useState<ImageData | null>(null);
   const [imageAnalysis, setImageAnalysis] = useState<ImageAnalysis | null>(
     null,
@@ -39,32 +40,45 @@ function App() {
       return;
     }
 
+    const generation = ++openGenerationRef.current;
     setOpening(true);
+
     try {
       const decoded = await decodeImageFile(file);
-      // Show pixels first so the window stays responsive on large camera JPEGs.
+      if (generation !== openGenerationRef.current) return;
+
+      // Show the photo immediately and leave the "Opening…" state.
       setSource(decoded.working);
       setImageAnalysis(null);
       setFileName(file.name);
       setParams({ ...DEFAULT_EDIT_PARAMETERS });
-      await yieldToUi();
+      setOpening(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
 
+      await yieldToUi();
+      if (generation !== openGenerationRef.current) return;
+
+      // Analysis is best-effort and must never block opening.
       try {
         const analysis = await analyzeImage(decoded.working, {
           width: decoded.originalWidth,
           height: decoded.originalHeight,
         });
+        if (generation !== openGenerationRef.current) return;
         setImageAnalysis(analysis);
       } catch {
-        // Image is still usable; AI edits stay disabled without analysis.
+        if (generation !== openGenerationRef.current) return;
         setImageAnalysis(null);
       }
     } catch {
-      window.alert("Could not open that image.");
-    } finally {
-      setOpening(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
+      if (generation === openGenerationRef.current) {
+        window.alert("Could not open that image.");
+        setOpening(false);
+        if (fileInputRef.current) {
+          fileInputRef.current.value = "";
+        }
       }
     }
   }

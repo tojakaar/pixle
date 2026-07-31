@@ -64,7 +64,12 @@ export async function analyzeImage(
 
   const reportWidth = originalSize?.width ?? source.width;
   const reportHeight = originalSize?.height ?? source.height;
-  const facesResult = await detectFaces(sample, reportWidth, reportHeight);
+  const facesResult = await detectFacesWithTimeout(
+    sample,
+    reportWidth,
+    reportHeight,
+    300,
+  );
 
   return {
     width: reportWidth,
@@ -277,6 +282,27 @@ function round2(value: number): number {
 interface FaceDetectionResult {
   available: boolean;
   faces: DetectedFace[] | null;
+}
+
+async function detectFacesWithTimeout(
+  sample: ImageData,
+  originalWidth: number,
+  originalHeight: number,
+  timeoutMs: number,
+): Promise<FaceDetectionResult> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      detectFaces(sample, originalWidth, originalHeight),
+      new Promise<FaceDetectionResult>((resolve) => {
+        timer = setTimeout(() => {
+          resolve({ available: false, faces: null });
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 async function detectFaces(
