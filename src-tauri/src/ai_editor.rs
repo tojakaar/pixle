@@ -130,10 +130,18 @@ pub async fn edit_from_prompt(
         return Err("Prompt must not be empty.".to_string());
     }
 
-    let api_key =
-        std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is not set.".to_string())?;
+    let api_key = std::env::var("OPENAI_API_KEY").map_err(|_| {
+        "OPENAI_API_KEY is not set. Copy `.env.example` to `.env` in the project root (not `.env.example`) and put your key there, then restart the app.".to_string()
+    })?;
     if api_key.trim().is_empty() {
-        return Err("OPENAI_API_KEY is empty.".to_string());
+        return Err("OPENAI_API_KEY is empty in `.env`.".to_string());
+    }
+    // Ignore placeholder values left over from `.env.example`.
+    if api_key.contains("your-key-here") || api_key == "sk-your-key-here" {
+        return Err(
+            "OPENAI_API_KEY still looks like the placeholder. Set your real key in `.env` (gitignored), not `.env.example`."
+                .to_string(),
+        );
     }
 
     let base_url = std::env::var("OPENAI_BASE_URL")
