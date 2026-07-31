@@ -5,6 +5,7 @@ import { ImageViewport } from "./components/ImageViewport";
 import {
   DEFAULT_EDIT_PARAMETERS,
   analyzeImage,
+  analyzeImageSync,
   decodeImageFile,
   yieldToUi,
   type EditParameters,
@@ -47,9 +48,14 @@ function App() {
       const decoded = await decodeImageFile(file);
       if (generation !== openGenerationRef.current) return;
 
-      // Show the photo immediately and leave the "Opening…" state.
+      // Sync analysis is cheap on the working buffer — enable Ask pixle immediately.
+      const quickAnalysis = analyzeImageSync(decoded.working, {
+        width: decoded.originalWidth,
+        height: decoded.originalHeight,
+      });
+
       setSource(decoded.working);
-      setImageAnalysis(null);
+      setImageAnalysis(quickAnalysis);
       setFileName(file.name);
       setParams({ ...DEFAULT_EDIT_PARAMETERS });
       setOpening(false);
@@ -60,7 +66,7 @@ function App() {
       await yieldToUi();
       if (generation !== openGenerationRef.current) return;
 
-      // Analysis is best-effort and must never block opening.
+      // Optional face enrichment; never clears the quick analysis on failure.
       try {
         const analysis = await analyzeImage(decoded.working, {
           width: decoded.originalWidth,
@@ -69,8 +75,7 @@ function App() {
         if (generation !== openGenerationRef.current) return;
         setImageAnalysis(analysis);
       } catch {
-        if (generation !== openGenerationRef.current) return;
-        setImageAnalysis(null);
+        // Keep quickAnalysis already applied.
       }
     } catch {
       if (generation === openGenerationRef.current) {

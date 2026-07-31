@@ -22,11 +22,14 @@ export function AiEditorPanel({
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [statusTone, setStatusTone] = useState<"ok" | "error">("ok");
+
+  const chatReady = Boolean(imageAnalysis) && !disabled;
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     const trimmed = prompt.trim();
-    if (!trimmed || disabled || busy || !imageAnalysis) return;
+    if (!trimmed || !chatReady || busy || !imageAnalysis) return;
 
     setBusy(true);
     setStatus(null);
@@ -35,9 +38,15 @@ export function AiEditorPanel({
       const result = await editFromPrompt(trimmed, params, imageAnalysis);
       onApply(result.parameters);
       setPrompt("");
+      setStatusTone("ok");
       setStatus(result.editSummary?.trim() || "Applied to sliders");
-    } catch {
-      setStatus("Could not apply that edit");
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message.trim()
+          ? error.message
+          : "Could not apply that edit";
+      setStatusTone("error");
+      setStatus(message);
     } finally {
       setBusy(false);
     }
@@ -48,7 +57,14 @@ export function AiEditorPanel({
       <header className="ai-panel__header">
         <h2 className="ai-panel__title">Ask pixle</h2>
         {status ? (
-          <span className="ai-panel__status" title={status}>
+          <span
+            className={
+              statusTone === "error"
+                ? "ai-panel__status ai-panel__status--error"
+                : "ai-panel__status"
+            }
+            title={status}
+          >
             {status}
           </span>
         ) : null}
@@ -59,11 +75,13 @@ export function AiEditorPanel({
           type="text"
           className="ai-panel__input"
           value={prompt}
-          disabled={disabled || busy}
+          disabled={!chatReady || busy}
           placeholder={
             disabled
               ? "Open an image to edit with AI"
-              : 'Try “cinematic”, “warm sunset”, or “recover the highlights”'
+              : !imageAnalysis
+                ? "Preparing image analysis…"
+                : 'Try “cinematic”, “warm sunset”, or “recover the highlights”'
           }
           onChange={(e) => setPrompt(e.currentTarget.value)}
           aria-label="Edit instruction"
@@ -71,7 +89,7 @@ export function AiEditorPanel({
         <button
           type="submit"
           className="ai-panel__send"
-          disabled={disabled || busy || !prompt.trim() || !imageAnalysis}
+          disabled={!chatReady || busy || !prompt.trim()}
         >
           {busy ? "Sending…" : "Send"}
         </button>

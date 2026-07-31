@@ -55,21 +55,14 @@ const SHADOW_CLIP_THRESHOLD = 5;
  * Analyse `source` locally on a downscaled working copy.
  * Original dimensions are preserved in the result; full-res pixels are not kept.
  */
-export async function analyzeImage(
+export function analyzeImageSync(
   source: ImageData,
   originalSize?: { width: number; height: number },
-): Promise<ImageAnalysis> {
+): ImageAnalysis {
   const sample = downsampleImageData(source, ANALYSIS_MAX_EDGE);
   const stats = computePixelStats(sample);
-
   const reportWidth = originalSize?.width ?? source.width;
   const reportHeight = originalSize?.height ?? source.height;
-  const facesResult = await detectFacesWithTimeout(
-    sample,
-    reportWidth,
-    reportHeight,
-    300,
-  );
 
   return {
     width: reportWidth,
@@ -82,6 +75,28 @@ export async function analyzeImage(
     dominantColours: stats.dominantColours,
     highlightClippingPercent: stats.highlightClippingPercent,
     shadowClippingPercent: stats.shadowClippingPercent,
+    faces: null,
+    faceDetectionAvailable: false,
+  };
+}
+
+/**
+ * Full analysis including an optional short face-detection attempt.
+ */
+export async function analyzeImage(
+  source: ImageData,
+  originalSize?: { width: number; height: number },
+): Promise<ImageAnalysis> {
+  const base = analyzeImageSync(source, originalSize);
+  const facesResult = await detectFacesWithTimeout(
+    downsampleImageData(source, ANALYSIS_MAX_EDGE),
+    base.width,
+    base.height,
+    300,
+  );
+
+  return {
+    ...base,
     faces: facesResult.faces,
     faceDetectionAvailable: facesResult.available,
   };

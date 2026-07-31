@@ -9,7 +9,7 @@ export type {
   DominantColour,
   ImageAnalysis,
 } from "./imageAnalysis";
-export { analyzeImage } from "./imageAnalysis";
+export { analyzeImage, analyzeImageSync } from "./imageAnalysis";
 export type { DecodedImage } from "./imageDecode";
 export {
   MAX_WORKING_EDGE,

@@ -187,6 +187,10 @@ input {
   color: var(--accent);
 }
 
+.ai-panel__status--error {
+  color: #a33b2d;
+}
+
 .ai-panel__form {
   display: flex;
   align-items: center;
