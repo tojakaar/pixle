@@ -11,13 +11,20 @@ interface ImageViewportProps {
   params: EditParameters;
   /** Opens the JPEG/PNG file picker from the empty state. */
   onOpenImage: () => void;
+  /** True while the user is peeking at the untouched original. */
+  comparing?: boolean;
 }
 
 /**
  * Centres the photo in the available space and draws a non-destructive preview
  * produced by the rendering engine.
  */
-export function ImageViewport({ source, params, onOpenImage }: ImageViewportProps) {
+export function ImageViewport({
+  source,
+  params,
+  onOpenImage,
+  comparing = false,
+}: ImageViewportProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -55,11 +62,11 @@ export function ImageViewport({ source, params, onOpenImage }: ImageViewportProp
   }
 
   return (
-    <div className="viewport">
+    <div className={comparing ? "viewport viewport--comparing" : "viewport"}>
       <canvas
         ref={canvasRef}
         className="viewport__canvas"
-        aria-label="Photo preview"
+        aria-label={comparing ? "Original photo" : "Edited photo preview"}
       />
     </div>
   );

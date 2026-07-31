@@ -24,13 +24,36 @@ fn load_env_files() {
     }
 }
 
+/// Fallback binary write for export. Prefer the fs plugin from the frontend;
+/// this remains available if a caller needs an unconstrained absolute path.
+#[tauri::command]
+fn save_image_file(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    let target = PathBuf::from(&path);
+    let ext = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "jpg" | "jpeg" | "png") {
+        return Err("Export path must end with .jpg, .jpeg, or .png.".to_string());
+    }
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            return Err(format!("Export folder does not exist: {}", parent.display()));
+        }
+    }
+    std::fs::write(&target, bytes).map_err(|e| format!("Failed to save image: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     load_env_files();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![edit_from_prompt])
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
+        .invoke_handler(tauri::generate_handler![edit_from_prompt, save_image_file])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
