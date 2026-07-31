@@ -55,15 +55,20 @@ const SHADOW_CLIP_THRESHOLD = 5;
  * Analyse `source` locally on a downscaled working copy.
  * Original dimensions are preserved in the result; full-res pixels are not kept.
  */
-export async function analyzeImage(source: ImageData): Promise<ImageAnalysis> {
-  const sample = downsampleForAnalysis(source);
+export async function analyzeImage(
+  source: ImageData,
+  originalSize?: { width: number; height: number },
+): Promise<ImageAnalysis> {
+  const sample = downsampleImageData(source, ANALYSIS_MAX_EDGE);
   const stats = computePixelStats(sample);
 
-  const facesResult = await detectFaces(source);
+  const reportWidth = originalSize?.width ?? source.width;
+  const reportHeight = originalSize?.height ?? source.height;
+  const facesResult = await detectFaces(sample, reportWidth, reportHeight);
 
   return {
-    width: source.width,
-    height: source.height,
+    width: reportWidth,
+    height: reportHeight,
     brightnessHistogram: stats.brightnessHistogram,
     averageColourTemperatureKelvin: stats.averageColourTemperatureKelvin,
     colourTemperatureLabel: colourTemperatureLabel(
@@ -77,13 +82,17 @@ export async function analyzeImage(source: ImageData): Promise<ImageAnalysis> {
   };
 }
 
-function downsampleForAnalysis(source: ImageData): ImageData {
-  const maxEdge = Math.max(source.width, source.height);
-  if (maxEdge <= ANALYSIS_MAX_EDGE) {
+/** Nearest-neighbour downscale; never allocates a DOM canvas. */
+export function downsampleImageData(
+  source: ImageData,
+  maxEdge: number,
+): ImageData {
+  const sourceMax = Math.max(source.width, source.height);
+  if (sourceMax <= maxEdge) {
     return source;
   }
 
-  const scale = ANALYSIS_MAX_EDGE / maxEdge;
+  const scale = maxEdge / sourceMax;
   const width = Math.max(1, Math.round(source.width * scale));
   const height = Math.max(1, Math.round(source.height * scale));
   const output = new ImageData(width, height);
@@ -270,7 +279,11 @@ interface FaceDetectionResult {
   faces: DetectedFace[] | null;
 }
 
-async function detectFaces(source: ImageData): Promise<FaceDetectionResult> {
+async function detectFaces(
+  sample: ImageData,
+  originalWidth: number,
+  originalHeight: number,
+): Promise<FaceDetectionResult> {
   const Detector = (
     globalThis as unknown as {
       FaceDetector?: new (options?: {
@@ -290,40 +303,27 @@ async function detectFaces(source: ImageData): Promise<FaceDetectionResult> {
 
   try {
     const detector = new Detector({ fastMode: true, maxDetectedFaces: 10 });
-    // Detect on a moderate-resolution bitmap for speed; scale boxes back.
-    const maxEdge = Math.max(source.width, source.height);
-    const detectEdge = Math.min(maxEdge, 640);
-    const scale = detectEdge / maxEdge;
-    const dw = Math.max(1, Math.round(source.width * scale));
-    const dh = Math.max(1, Math.round(source.height * scale));
 
+    // Paint only the already-small sample — never a full-resolution canvas.
     const canvas = document.createElement("canvas");
-    canvas.width = dw;
-    canvas.height = dh;
+    canvas.width = sample.width;
+    canvas.height = sample.height;
     const ctx = canvas.getContext("2d");
     if (!ctx) {
       return { available: false, faces: null };
     }
-
-    const srcCanvas = document.createElement("canvas");
-    srcCanvas.width = source.width;
-    srcCanvas.height = source.height;
-    const srcCtx = srcCanvas.getContext("2d");
-    if (!srcCtx) {
-      return { available: false, faces: null };
-    }
-    srcCtx.putImageData(source, 0, 0);
-    ctx.drawImage(srcCanvas, 0, 0, dw, dh);
+    ctx.putImageData(sample, 0, 0);
 
     const detected = await detector.detect(canvas);
-    const inv = 1 / scale;
+    const scaleX = originalWidth / sample.width;
+    const scaleY = originalHeight / sample.height;
     const faces: DetectedFace[] = detected.map((face) => {
       const box = face.boundingBox;
       return {
-        x: Math.round(box.x * inv),
-        y: Math.round(box.y * inv),
-        width: Math.round(box.width * inv),
-        height: Math.round(box.height * inv),
+        x: Math.round(box.x * scaleX),
+        y: Math.round(box.y * scaleY),
+        width: Math.round(box.width * scaleX),
+        height: Math.round(box.height * scaleY),
       };
     });
 

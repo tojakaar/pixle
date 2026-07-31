@@ -5,26 +5,12 @@ import { ImageViewport } from "./components/ImageViewport";
 import {
   DEFAULT_EDIT_PARAMETERS,
   analyzeImage,
+  decodeImageFile,
+  yieldToUi,
   type EditParameters,
   type ImageAnalysis,
 } from "./engine";
 import "./App.css";
-
-async function decodeImageFile(file: File): Promise<ImageData> {
-  const bitmap = await createImageBitmap(file);
-  const canvas = document.createElement("canvas");
-  canvas.width = bitmap.width;
-  canvas.height = bitmap.height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) {
-    bitmap.close();
-    throw new Error("Could not create canvas context");
-  }
-  ctx.drawImage(bitmap, 0, 0);
-  const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
-  bitmap.close();
-  return imageData;
-}
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -33,6 +19,7 @@ function App() {
     null,
   );
   const [fileName, setFileName] = useState<string | null>(null);
+  const [opening, setOpening] = useState(false);
   const [params, setParams] = useState<EditParameters>({
     ...DEFAULT_EDIT_PARAMETERS,
   });
@@ -40,7 +27,7 @@ function App() {
 
   async function handleFileChange(fileList: FileList | null) {
     const file = fileList?.[0];
-    if (!file) return;
+    if (!file || opening) return;
 
     const accepted =
       file.type === "image/jpeg" ||
@@ -52,16 +39,30 @@ function App() {
       return;
     }
 
+    setOpening(true);
     try {
-      const imageData = await decodeImageFile(file);
-      const analysis = await analyzeImage(imageData);
-      setSource(imageData);
-      setImageAnalysis(analysis);
+      const decoded = await decodeImageFile(file);
+      // Show pixels first so the window stays responsive on large camera JPEGs.
+      setSource(decoded.working);
+      setImageAnalysis(null);
       setFileName(file.name);
       setParams({ ...DEFAULT_EDIT_PARAMETERS });
+      await yieldToUi();
+
+      try {
+        const analysis = await analyzeImage(decoded.working, {
+          width: decoded.originalWidth,
+          height: decoded.originalHeight,
+        });
+        setImageAnalysis(analysis);
+      } catch {
+        // Image is still usable; AI edits stay disabled without analysis.
+        setImageAnalysis(null);
+      }
     } catch {
       window.alert("Could not open that image.");
     } finally {
+      setOpening(false);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
       }
@@ -69,6 +70,7 @@ function App() {
   }
 
   function openImagePicker() {
+    if (opening) return;
     fileInputRef.current?.click();
   }
 
@@ -87,9 +89,10 @@ function App() {
           <button
             type="button"
             className="toolbar__open"
+            disabled={opening}
             onClick={openImagePicker}
           >
-            Open Image
+            {opening ? "Opening…" : "Open Image"}
           </button>
           {fileName ? (
             <span className="toolbar__filename" title={fileName}>
@@ -109,13 +112,13 @@ function App() {
           <AiEditorPanel
             params={params}
             imageAnalysis={imageAnalysis}
-            disabled={!source}
+            disabled={!source || opening}
             onApply={setParams}
           />
         </div>
         <EditPanel
           params={params}
-          disabled={!source}
+          disabled={!source || opening}
           onChange={setParams}
         />
       </div>
