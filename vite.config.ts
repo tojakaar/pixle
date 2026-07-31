@@ -17,6 +17,8 @@ export default defineConfig(async () => ({
     port: 1420,
     strictPort: true,
     host: host || false,
+    // Cursor Cloud / VM preview URLs (*.cursorvm.com) must be explicitly allowed.
+    allowedHosts: [".cursorvm.com", "localhost"],
     hmr: host
       ? {
           protocol: "ws",
