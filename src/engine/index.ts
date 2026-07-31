@@ -33,3 +33,11 @@ export {
   resetEdit,
   undoEdit,
 } from "./editHistory";
+export type { ParameterChange } from "./editDiff";
+export {
+  EDIT_PARAMETER_KEYS,
+  diffParameters,
+  lerpParameters,
+} from "./editDiff";
+export type { Look } from "./looks";
+export { BUILTIN_LOOKS } from "./looks";

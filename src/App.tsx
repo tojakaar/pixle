@@ -5,6 +5,7 @@ import { ImageToolbar } from "./components/ImageToolbar";
 import { ImageViewport } from "./components/ImageViewport";
 import { exportEditedImage } from "./exportFile";
 import {
+  BUILTIN_LOOKS,
   DEFAULT_EDIT_PARAMETERS,
   analyzeImage,
   analyzeImageSync,
@@ -13,6 +14,8 @@ import {
   commitEdit,
   createEditHistory,
   decodeImageFile,
+  diffParameters,
+  lerpParameters,
   parametersEqual,
   redoEdit,
   resetEdit,
@@ -21,13 +24,23 @@ import {
   type EditHistoryState,
   type EditParameters,
   type ImageAnalysis,
+  type Look,
 } from "./engine";
+import { loadSavedLooks, saveLook } from "./looksStorage";
 import "./App.css";
+
+/** Tracks the most recent AI or look apply for intensity + changes. */
+interface LastEditSession {
+  before: EditParameters;
+  after: EditParameters;
+  intensity: number;
+}
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const openGenerationRef = useRef(0);
   const holdingBeforeRef = useRef(false);
+  const presentRef = useRef<EditParameters>({ ...DEFAULT_EDIT_PARAMETERS });
   const [source, setSource] = useState<ImageData | null>(null);
   /** Original file kept for full-resolution export (never mutated). */
   const [sourceFile, setSourceFile] = useState<File | null>(null);
@@ -44,12 +57,21 @@ function App() {
   );
   const [showingBefore, setShowingBefore] = useState(false);
   const [, setBeforeLatched] = useState(false);
+  const [lastEdit, setLastEdit] = useState<LastEditSession | null>(null);
+  const [customLooks, setCustomLooks] = useState<Look[]>(() =>
+    loadSavedLooks(),
+  );
 
   const params = history.present;
+  presentRef.current = params;
   const previewParams = useDeferredValue(params);
   const displayParams = showingBefore
     ? DEFAULT_EDIT_PARAMETERS
     : previewParams;
+
+  const changes = lastEdit
+    ? diffParameters(lastEdit.before, lastEdit.after)
+    : [];
 
   async function handleFileChange(fileList: FileList | null) {
     const file = fileList?.[0];
@@ -71,6 +93,7 @@ function App() {
     setShowingBefore(false);
     setBeforeLatched(false);
     holdingBeforeRef.current = false;
+    setLastEdit(null);
 
     try {
       const decoded = await decodeImageFile(file);
@@ -122,33 +145,64 @@ function App() {
     fileInputRef.current?.click();
   }
 
-  function applyParams(next: EditParameters) {
-    setHistory((prev) => {
-      if (parametersEqual(prev.present, next)) return prev;
-      return commitEdit(prev, next);
+  /** Commit a new present state and bind intensity/changes to that edit. */
+  function applyCommittedEdit(next: EditParameters) {
+    const before = presentRef.current;
+    if (parametersEqual(before, next)) return;
+
+    setLastEdit({
+      before: { ...before },
+      after: { ...next },
+      intensity: 100,
     });
+    setHistory((prev) => commitEdit(prev, next));
   }
 
-  /** Slider drags update the present state without creating history steps. */
-  function setParamsLive(next: EditParameters) {
+  /**
+   * Live parameter updates without a history step.
+   * Manual Adjust drags clear the last-edit session so Intensity/Changes
+   * stay tied only to the most recent AI or look apply.
+   */
+  function setParamsLive(
+    next: EditParameters,
+    options?: { preserveLastEdit?: boolean },
+  ) {
     setHistory((prev) => ({
       ...prev,
       present: { ...next },
       // Live slider changes discard redo — present has diverged.
       future: [],
     }));
+    if (!options?.preserveLastEdit) {
+      setLastEdit(null);
+    }
+  }
+
+  function handleIntensityChange(value: number) {
+    if (!lastEdit) return;
+    const intensity = Math.min(100, Math.max(0, value));
+    const blended = lerpParameters(
+      lastEdit.before,
+      lastEdit.after,
+      intensity / 100,
+    );
+    setLastEdit({ ...lastEdit, intensity });
+    setParamsLive(blended, { preserveLastEdit: true });
   }
 
   function handleUndo() {
     setHistory((prev) => undoEdit(prev));
+    setLastEdit(null);
   }
 
   function handleRedo() {
     setHistory((prev) => redoEdit(prev));
+    setLastEdit(null);
   }
 
   function handleReset() {
     setHistory((prev) => resetEdit(prev));
+    setLastEdit(null);
     setShowingBefore(false);
     setBeforeLatched(false);
     holdingBeforeRef.current = false;
@@ -182,6 +236,22 @@ function App() {
       setShowingBefore(next);
       return next;
     });
+  }
+
+  function handleApplyLook(look: Look) {
+    applyCommittedEdit({ ...look.parameters });
+  }
+
+  function handleSaveLook() {
+    if (!source) return;
+    const name = window.prompt("Name this look");
+    if (name === null) return;
+    const saved = saveLook(name, params);
+    if (!saved) {
+      window.alert("Please enter a name for the look.");
+      return;
+    }
+    setCustomLooks(loadSavedLooks());
   }
 
   async function handleExport() {
@@ -255,6 +325,9 @@ function App() {
   }, [source]);
 
   const imageReady = Boolean(source) && !opening;
+  const controlsDisabled = !source || opening || exporting;
+  const canSaveLook =
+    imageReady && !parametersEqual(params, DEFAULT_EDIT_PARAMETERS);
 
   return (
     <div className="app">
@@ -329,15 +402,23 @@ function App() {
           <AiEditorPanel
             params={params}
             imageAnalysis={imageAnalysis}
-            disabled={!source || opening || exporting}
-            onApply={applyParams}
+            disabled={controlsDisabled}
+            onApply={applyCommittedEdit}
           />
         </div>
         <EditPanel
           params={params}
-          disabled={!source || opening || exporting}
+          disabled={controlsDisabled}
           onChange={setParamsLive}
           onReset={handleReset}
+          intensity={lastEdit ? lastEdit.intensity : null}
+          onIntensityChange={handleIntensityChange}
+          changes={changes}
+          builtinLooks={BUILTIN_LOOKS}
+          customLooks={customLooks}
+          canSaveLook={canSaveLook}
+          onSaveLook={handleSaveLook}
+          onApplyLook={handleApplyLook}
         />
       </div>
     </div>

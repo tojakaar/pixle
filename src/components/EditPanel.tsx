@@ -4,6 +4,11 @@ import {
   type EditParameterKey,
   type EditParameters,
 } from "../engine";
+import type { ParameterChange } from "../engine/editDiff";
+import type { Look } from "../engine/looks";
+import { ChangesPanel } from "./ChangesPanel";
+import { IntensityControl } from "./IntensityControl";
+import { LooksPanel } from "./LooksPanel";
 
 interface EditPanelProps {
   params: EditParameters;
@@ -11,6 +16,15 @@ interface EditPanelProps {
   onChange: (params: EditParameters) => void;
   /** History-aware reset; falls back to identity params when omitted. */
   onReset?: () => void;
+  /** Most recent AI/look edit intensity (0–100), or null when none. */
+  intensity: number | null;
+  onIntensityChange: (value: number) => void;
+  changes: ParameterChange[];
+  builtinLooks: Look[];
+  customLooks: Look[];
+  canSaveLook: boolean;
+  onSaveLook: () => void;
+  onApplyLook: (look: Look) => void;
 }
 
 const SLIDER_ORDER: EditParameterKey[] = [
@@ -35,6 +49,14 @@ export function EditPanel({
   disabled,
   onChange,
   onReset,
+  intensity,
+  onIntensityChange,
+  changes,
+  builtinLooks,
+  customLooks,
+  canSaveLook,
+  onSaveLook,
+  onApplyLook,
 }: EditPanelProps) {
   function update(key: EditParameterKey, value: number) {
     onChange({ ...params, [key]: value });
@@ -42,6 +64,25 @@ export function EditPanel({
 
   return (
     <aside className="edit-panel" aria-label="Edit controls">
+      {intensity !== null ? (
+        <IntensityControl
+          value={intensity}
+          disabled={disabled}
+          onChange={onIntensityChange}
+        />
+      ) : null}
+
+      <ChangesPanel changes={changes} />
+
+      <LooksPanel
+        builtinLooks={builtinLooks}
+        customLooks={customLooks}
+        disabled={disabled}
+        canSave={canSaveLook}
+        onApply={onApplyLook}
+        onSave={onSaveLook}
+      />
+
       <header className="edit-panel__header">
         <h2 className="edit-panel__title">Adjust</h2>
         <button
