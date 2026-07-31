@@ -1,50 +1,109 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useDeferredValue, useRef, useState } from "react";
+import { AiEditorPanel } from "./components/AiEditorPanel";
+import { EditPanel } from "./components/EditPanel";
+import { ImageViewport } from "./components/ImageViewport";
+import {
+  DEFAULT_EDIT_PARAMETERS,
+  type EditParameters,
+} from "./engine";
 import "./App.css";
 
-function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+async function decodeImageFile(file: File): Promise<ImageData> {
+  const bitmap = await createImageBitmap(file);
+  const canvas = document.createElement("canvas");
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) {
+    bitmap.close();
+    throw new Error("Could not create canvas context");
+  }
+  ctx.drawImage(bitmap, 0, 0);
+  const imageData = ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+  bitmap.close();
+  return imageData;
+}
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+function App() {
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [source, setSource] = useState<ImageData | null>(null);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [params, setParams] = useState<EditParameters>({
+    ...DEFAULT_EDIT_PARAMETERS,
+  });
+  const previewParams = useDeferredValue(params);
+
+  async function handleFileChange(fileList: FileList | null) {
+    const file = fileList?.[0];
+    if (!file) return;
+
+    const accepted =
+      file.type === "image/jpeg" ||
+      file.type === "image/png" ||
+      /\.(jpe?g|png)$/i.test(file.name);
+
+    if (!accepted) {
+      window.alert("Please choose a JPEG or PNG image.");
+      return;
+    }
+
+    try {
+      const imageData = await decodeImageFile(file);
+      setSource(imageData);
+      setFileName(file.name);
+      setParams({ ...DEFAULT_EDIT_PARAMETERS });
+    } catch {
+      window.alert("Could not open that image.");
+    } finally {
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
   }
 
   return (
-    <main className="container">
-      <h1>Welcome to Tauri + React</h1>
+    <div className="app">
+      <header className="toolbar">
+        <div className="toolbar__brand">pixle</div>
+        <div className="toolbar__actions">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/jpeg,image/png,.jpg,.jpeg,.png"
+            className="toolbar__file-input"
+            onChange={(e) => handleFileChange(e.currentTarget.files)}
+          />
+          <button
+            type="button"
+            className="toolbar__open"
+            onClick={() => fileInputRef.current?.click()}
+          >
+            Open image
+          </button>
+          {fileName ? (
+            <span className="toolbar__filename" title={fileName}>
+              {fileName}
+            </span>
+          ) : null}
+        </div>
+      </header>
 
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
-      <form
-        className="row"
-        onSubmit={(e) => {
-          e.preventDefault();
-          greet();
-        }}
-      >
-        <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name..."
+      <div className="workspace">
+        <div className="workspace__main">
+          <ImageViewport source={source} params={previewParams} />
+          <AiEditorPanel
+            params={params}
+            disabled={!source}
+            onApply={setParams}
+          />
+        </div>
+        <EditPanel
+          params={params}
+          disabled={!source}
+          onChange={setParams}
         />
-        <button type="submit">Greet</button>
-      </form>
-      <p>{greetMsg}</p>
-    </main>
+      </div>
+    </div>
   );
 }
 
