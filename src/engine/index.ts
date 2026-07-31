@@ -16,3 +16,20 @@ export {
   decodeImageFile,
   yieldToUi,
 } from "./imageDecode";
+export type { ExportFormat } from "./exportImage";
+export {
+  defaultExportFileName,
+  formatFromPath,
+  renderEditedImageBytes,
+} from "./exportImage";
+export type { EditHistoryState } from "./editHistory";
+export {
+  canRedo,
+  canUndo,
+  commitEdit,
+  createEditHistory,
+  parametersEqual,
+  redoEdit,
+  resetEdit,
+  undoEdit,
+} from "./editHistory";

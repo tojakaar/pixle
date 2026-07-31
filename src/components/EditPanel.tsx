@@ -9,6 +9,8 @@ interface EditPanelProps {
   params: EditParameters;
   disabled: boolean;
   onChange: (params: EditParameters) => void;
+  /** History-aware reset; falls back to identity params when omitted. */
+  onReset?: () => void;
 }
 
 const SLIDER_ORDER: EditParameterKey[] = [
@@ -28,7 +30,12 @@ function formatValue(key: EditParameterKey, value: number): string {
   return String(Math.round(value));
 }
 
-export function EditPanel({ params, disabled, onChange }: EditPanelProps) {
+export function EditPanel({
+  params,
+  disabled,
+  onChange,
+  onReset,
+}: EditPanelProps) {
   function update(key: EditParameterKey, value: number) {
     onChange({ ...params, [key]: value });
   }
@@ -41,7 +48,9 @@ export function EditPanel({ params, disabled, onChange }: EditPanelProps) {
           type="button"
           className="edit-panel__reset"
           disabled={disabled}
-          onClick={() => onChange({ ...DEFAULT_EDIT_PARAMETERS })}
+          onClick={() =>
+            onReset ? onReset() : onChange({ ...DEFAULT_EDIT_PARAMETERS })
+          }
         >
           Reset
         </button>
