@@ -1,0 +1,6 @@
+# Pin to a modern stable toolchain.
+# Tauri v2's dependency tree (e.g. zbus) requires Rust >= 1.85 for the
+# stabilized `edition2024` Cargo feature, so the VM's older default is not enough.
+[toolchain]
+channel = "stable"
+profile = "minimal"
