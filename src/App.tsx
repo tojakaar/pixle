@@ -1,4 +1,5 @@
 import { useDeferredValue, useRef, useState } from "react";
+import { AiEditorPanel } from "./components/AiEditorPanel";
 import { EditPanel } from "./components/EditPanel";
 import { ImageViewport } from "./components/ImageViewport";
 import {
@@ -88,7 +89,14 @@ function App() {
       </header>
 
       <div className="workspace">
-        <ImageViewport source={source} params={previewParams} />
+        <div className="workspace__main">
+          <ImageViewport source={source} params={previewParams} />
+          <AiEditorPanel
+            params={params}
+            disabled={!source}
+            onApply={setParams}
+          />
+        </div>
         <EditPanel
           params={params}
           disabled={!source}

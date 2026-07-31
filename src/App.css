@@ -132,16 +132,107 @@ input {
   min-height: 0;
 }
 
+.workspace__main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
 .viewport {
   display: flex;
   align-items: center;
   justify-content: center;
+  flex: 1;
   min-width: 0;
   min-height: 0;
   padding: 1.25rem;
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.03), transparent 40%),
     var(--bg-canvas);
+}
+
+.ai-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  flex-shrink: 0;
+  padding: 0.85rem 1rem 1rem;
+  background: color-mix(in srgb, var(--bg-toolbar) 88%, white);
+  border-top: 1px solid var(--border);
+}
+
+.ai-panel__header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.ai-panel__title {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.ai-panel__status {
+  font-size: 0.8rem;
+  color: var(--accent);
+}
+
+.ai-panel__form {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.ai-panel__input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.55rem 0.75rem;
+  background: #fff;
+  color: var(--text);
+  outline: none;
+  transition: border-color 140ms ease;
+}
+
+.ai-panel__input:focus {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+}
+
+.ai-panel__input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  background: color-mix(in srgb, var(--bg-panel) 70%, white);
+}
+
+.ai-panel__send {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 6px;
+  padding: 0.55rem 0.95rem;
+  background: var(--accent);
+  color: #f7faf9;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 160ms ease, transform 160ms ease;
+}
+
+.ai-panel__send:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.ai-panel__send:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.ai-panel__send:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .viewport--empty {
@@ -284,10 +375,14 @@ input {
     grid-template-rows: 1fr auto;
   }
 
+  .workspace__main {
+    min-height: 0;
+  }
+
   .edit-panel {
     border-left: none;
     border-top: 1px solid var(--border);
-    max-height: 42vh;
+    max-height: 36vh;
   }
 
   .toolbar__filename {
