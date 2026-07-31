@@ -67,33 +67,53 @@ struct ChatMessage {
     content: Option<String>,
 }
 
-const SYSTEM_PROMPT: &str = r#"You are a professional photo editor for Pixle.
-You make tasteful, technically sound non-destructive adjustments using slider parameters only. You never modify, generate, describe as binary, or return image data.
+const SYSTEM_PROMPT: &str = r#"You are an experienced professional Adobe Lightroom photo editor working inside Pixle.
+You think in photographic intent, not keyword matching. You never modify, generate, describe as binary, or return image pixels.
 
-You are given:
-1. Local ImageAnalysis metadata (histogram, colour temperature, dominant colours, clipping, dimensions, faces when available). Use it to understand the scene before adjusting.
-2. The current EditParameters (baseline). Apply incremental changes from these values.
-3. The user's natural-language instruction.
+You receive:
+1. ImageAnalysis — local metadata (histogram, colour temperature, dominant colours, highlight/shadow clipping, dimensions, faces when available). Use it as your light-table read of the file.
+2. Current EditParameters — the active, non-destructive baseline. Adjustments are incremental from these values.
+3. The user's instruction — interpret the aesthetic or technical goal.
 
-Return the full updated EditParameters as a single JSON object.
+Return one JSON object only (no markdown, no commentary outside JSON).
 
-Rules:
-- Respond with JSON only. No markdown, no commentary.
-- Include every key exactly once: exposure, contrast, highlights, shadows, temperature, tint, saturation.
-- Values must be finite numbers within these ranges:
-  - exposure: -2 to 2 (EV stops)
-  - contrast: -100 to 100
-  - highlights: -100 to 100 (negative recovers blown highlights)
-  - shadows: -100 to 100 (positive lifts shadows)
-  - temperature: -100 to 100 (negative cooler, positive warmer)
-  - tint: -100 to 100 (negative green, positive magenta)
-  - saturation: -100 to 100
-- Prefer moderate, photographically natural adjustments relative to the current values unless the user asks to reset or go extreme.
-- Let analysis guide decisions: high highlight clipping → pull highlights; crushed shadows → lift shadows; warm/cool Kelvin → temperature; faces present → protect skin (avoid extreme saturation/temperature).
-- Balance related controls when appropriate (e.g. brightening may slightly lift shadows; warming may need a small tint nudge).
-- If the instruction is unrelated to photo adjustments, return the current parameters unchanged.
-- Never return image pixels, histograms, or analysis fields — EditParameters only.
+## Output schema
+Required numeric EditParameters (include every key exactly once):
+- exposure: -2 to 2 (EV stops)
+- contrast: -100 to 100
+- highlights: -100 to 100 (negative recovers/protects bright areas)
+- shadows: -100 to 100 (positive opens shadow detail)
+- temperature: -100 to 100 (negative cooler / blue; positive warmer / amber)
+- tint: -100 to 100 (negative green; positive magenta)
+- saturation: -100 to 100
+
+Optional:
+- edit_summary: a short plain-language note (one sentence, ≤120 characters) explaining the intended adjustment. This is explanatory only — it is never applied to pixels.
+
+Do not return any other keys (no image data, histograms, analysis fields, or presets).
+
+## Editing principles
+- Read the request as photographic intent (mood, story, print goal), not literal keywords.
+- Always consult ImageAnalysis before deciding. Examples: high highlightClippingPercent → pull highlights / ease exposure; high shadowClippingPercent → lift shadows carefully; warm/cool Kelvin and colourTemperatureLabel → inform temperature/tint; dominantColours → guide saturation and white balance; faces present → protect natural skin tones.
+- Make coordinated multi-parameter moves. Exposure, contrast, highlights, shadows, temperature, tint, and saturation interact — change them as a set, not in isolation.
+- Prefer moderate, printable adjustments unless the user asks for a strong look or a reset.
+- Avoid clipping highlights further; when already clipped, prioritise recovery.
+- Avoid crushing shadow detail; keep texture in the lows unless a crushed-black look is clearly requested.
+- When faces are detected (or the request is a portrait): keep skin believable — restrain saturation and extreme temperature/tint swings; bias toward a natural portrait balance.
+- Style directions are aesthetic goals, not fixed presets. Translate them into tasteful parameter combinations informed by this specific image's analysis. Supported directions include (non-exhaustive): cinematic, film look, documentary, moody, warm sunset, editorial, natural portrait, vintage.
+- If the instruction is unrelated to photo editing, return the current parameters unchanged (edit_summary may say so).
 "#;
+
+/// Result of an AI edit: slider parameters plus an optional human-readable summary.
+/// Only `parameters` are applied to the image.
+#[derive(Debug, Clone, Serialize)]
+pub struct EditFromPromptResult {
+    #[serde(flatten)]
+    pub parameters: EditParameters,
+    /// Optional model explanation; never used as an image input.
+    #[serde(rename = "edit_summary", skip_serializing_if = "Option::is_none")]
+    pub edit_summary: Option<String>,
+}
 
 /// Interpret a natural-language edit prompt via an OpenAI-compatible chat API.
 ///
@@ -104,7 +124,7 @@ pub async fn edit_from_prompt(
     prompt: String,
     current_parameters: EditParameters,
     image_analysis: ImageAnalysis,
-) -> Result<EditParameters, String> {
+) -> Result<EditFromPromptResult, String> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
         return Err("Prompt must not be empty.".to_string());
@@ -193,7 +213,7 @@ pub async fn edit_from_prompt(
         )
     })?;
 
-    validate_edit_parameters(&value)
+    parse_edit_response(&value)
 }
 
 fn extract_json_object(content: &str) -> Result<String, String> {
@@ -217,12 +237,13 @@ fn extract_json_object(content: &str) -> Result<String, String> {
     ))
 }
 
-fn validate_edit_parameters(value: &Value) -> Result<EditParameters, String> {
+fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| "EditParameters JSON must be an object.".to_string())?;
 
     // Reject unexpected payload shapes (e.g. image blobs) before applying.
+    // `edit_summary` is the only optional non-parameter field allowed.
     const REQUIRED: [&str; 7] = [
         "exposure",
         "contrast",
@@ -232,6 +253,7 @@ fn validate_edit_parameters(value: &Value) -> Result<EditParameters, String> {
         "tint",
         "saturation",
     ];
+    const OPTIONAL: [&str; 1] = ["edit_summary"];
 
     for key in REQUIRED {
         if !obj.contains_key(key) {
@@ -240,19 +262,41 @@ fn validate_edit_parameters(value: &Value) -> Result<EditParameters, String> {
     }
 
     for key in obj.keys() {
-        if !REQUIRED.contains(&key.as_str()) {
+        let allowed = REQUIRED.contains(&key.as_str()) || OPTIONAL.contains(&key.as_str());
+        if !allowed {
             return Err(format!("Unexpected field `{key}` in EditParameters."));
         }
     }
 
-    Ok(EditParameters {
-        exposure: read_number(obj, "exposure", -2.0, 2.0)?,
-        contrast: read_number(obj, "contrast", -100.0, 100.0)?,
-        highlights: read_number(obj, "highlights", -100.0, 100.0)?,
-        shadows: read_number(obj, "shadows", -100.0, 100.0)?,
-        temperature: read_number(obj, "temperature", -100.0, 100.0)?,
-        tint: read_number(obj, "tint", -100.0, 100.0)?,
-        saturation: read_number(obj, "saturation", -100.0, 100.0)?,
+    let edit_summary = match obj.get("edit_summary") {
+        None => None,
+        Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                // Keep summaries short for the UI status line.
+                let truncated: String = trimmed.chars().take(160).collect();
+                Some(truncated)
+            }
+        }
+        Some(_) => {
+            return Err("Field `edit_summary` must be a string when present.".to_string());
+        }
+    };
+
+    Ok(EditFromPromptResult {
+        parameters: EditParameters {
+            exposure: read_number(obj, "exposure", -2.0, 2.0)?,
+            contrast: read_number(obj, "contrast", -100.0, 100.0)?,
+            highlights: read_number(obj, "highlights", -100.0, 100.0)?,
+            shadows: read_number(obj, "shadows", -100.0, 100.0)?,
+            temperature: read_number(obj, "temperature", -100.0, 100.0)?,
+            tint: read_number(obj, "tint", -100.0, 100.0)?,
+            saturation: read_number(obj, "saturation", -100.0, 100.0)?,
+        },
+        edit_summary,
     })
 }
 
@@ -329,9 +373,46 @@ mod tests {
             "tint": -5,
             "saturation": 15
         });
-        let parsed = validate_edit_parameters(&value).unwrap();
-        assert_eq!(parsed.exposure, 0.4);
-        assert_eq!(parsed.highlights, -30.0);
+        let parsed = parse_edit_response(&value).unwrap();
+        assert_eq!(parsed.parameters.exposure, 0.4);
+        assert_eq!(parsed.parameters.highlights, -30.0);
+        assert!(parsed.edit_summary.is_none());
+    }
+
+    #[test]
+    fn accepts_optional_edit_summary() {
+        let value = json!({
+            "exposure": 0.2,
+            "contrast": 10,
+            "highlights": -20,
+            "shadows": 15,
+            "temperature": 12,
+            "tint": 0,
+            "saturation": -5,
+            "edit_summary": "  Warm cinematic grade; protected highlights.  "
+        });
+        let parsed = parse_edit_response(&value).unwrap();
+        assert_eq!(parsed.parameters.exposure, 0.2);
+        assert_eq!(
+            parsed.edit_summary.as_deref(),
+            Some("Warm cinematic grade; protected highlights.")
+        );
+    }
+
+    #[test]
+    fn rejects_non_string_edit_summary() {
+        let value = json!({
+            "exposure": 0.0,
+            "contrast": 0.0,
+            "highlights": 0.0,
+            "shadows": 0.0,
+            "temperature": 0.0,
+            "tint": 0.0,
+            "saturation": 0.0,
+            "edit_summary": 123
+        });
+        let err = parse_edit_response(&value).unwrap_err();
+        assert!(err.contains("edit_summary"));
     }
 
     #[test]
@@ -346,7 +427,7 @@ mod tests {
             "saturation": 0.0,
             "imageBase64": "abc"
         });
-        let err = validate_edit_parameters(&value).unwrap_err();
+        let err = parse_edit_response(&value).unwrap_err();
         assert!(err.contains("Unexpected field"));
     }
 
@@ -356,7 +437,7 @@ mod tests {
             "exposure": 0.0,
             "contrast": 0.0
         });
-        let err = validate_edit_parameters(&value).unwrap_err();
+        let err = parse_edit_response(&value).unwrap_err();
         assert!(err.contains("Missing required field"));
     }
 
@@ -371,7 +452,7 @@ mod tests {
             "tint": 0.0,
             "saturation": 0.0
         });
-        let err = validate_edit_parameters(&value).unwrap_err();
+        let err = parse_edit_response(&value).unwrap_err();
         assert!(err.contains("must be a number"));
     }
 
@@ -386,9 +467,9 @@ mod tests {
             "tint": 0,
             "saturation": 0
         });
-        let parsed = validate_edit_parameters(&value).unwrap();
-        assert_eq!(parsed.exposure, 2.0);
-        assert_eq!(parsed.contrast, -100.0);
+        let parsed = parse_edit_response(&value).unwrap();
+        assert_eq!(parsed.parameters.exposure, 2.0);
+        assert_eq!(parsed.parameters.contrast, -100.0);
     }
 
     #[test]
@@ -420,6 +501,6 @@ mod tests {
         let next = edit_from_prompt("make it brighter".into(), current, sample_analysis())
             .await
             .expect("live AI edit should succeed");
-        assert!(next.exposure > 0.0);
+        assert!(next.parameters.exposure > 0.0);
     }
 }

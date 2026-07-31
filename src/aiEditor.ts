@@ -16,6 +16,16 @@ const EDIT_PARAMETER_KEYS: EditParameterKey[] = [
   "saturation",
 ];
 
+/** Optional model note; never applied as an image parameter. */
+const EDIT_SUMMARY_KEY = "edit_summary";
+
+export interface EditFromPromptResult {
+  /** Values applied to the non-destructive edit pipeline. */
+  parameters: EditParameters;
+  /** Short explanation from the model, if provided. */
+  editSummary?: string;
+}
+
 /**
  * Conversational photo-edit interface.
  *
@@ -23,13 +33,13 @@ const EDIT_PARAMETER_KEYS: EditParameterKey[] = [
  * server-side environment variables. The API key never enters the frontend.
  * Image understanding is provided as compact local `ImageAnalysis` metadata —
  * never full-resolution pixels.
- * The UI depends only on this function signature.
+ * Only `parameters` are applied to the image; `editSummary` is explanatory.
  */
 export async function editFromPrompt(
   prompt: string,
   currentParameters: EditParameters,
   imageAnalysis: ImageAnalysis,
-): Promise<EditParameters> {
+): Promise<EditFromPromptResult> {
   const trimmed = prompt.trim();
   if (!trimmed) {
     throw new Error("Prompt must not be empty.");
@@ -46,15 +56,15 @@ export async function editFromPrompt(
     throw new Error(formatInvokeError(error));
   }
 
-  return parseEditParameters(raw);
+  return parseEditResponse(raw);
 }
 
 /**
  * Validate LLM/backend JSON before applying it to the UI.
- * Rejects non-objects, missing keys, non-numeric values, and unexpected fields
- * (including any attempt to return image payloads).
+ * Accepts the EditParameters schema plus optional `edit_summary`.
+ * Rejects other unexpected fields (including image payloads).
  */
-export function parseEditParameters(value: unknown): EditParameters {
+export function parseEditResponse(value: unknown): EditFromPromptResult {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("EditParameters must be a JSON object.");
   }
@@ -69,21 +79,41 @@ export function parseEditParameters(value: unknown): EditParameters {
   }
 
   for (const key of keys) {
-    if (!EDIT_PARAMETER_KEYS.includes(key as EditParameterKey)) {
+    const allowed =
+      EDIT_PARAMETER_KEYS.includes(key as EditParameterKey) ||
+      key === EDIT_SUMMARY_KEY;
+    if (!allowed) {
       throw new Error(`Unexpected field \`${key}\` in EditParameters.`);
     }
   }
 
-  const result = {} as EditParameters;
+  const parameters = {} as EditParameters;
   for (const key of EDIT_PARAMETER_KEYS) {
     const rawValue = record[key];
     if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) {
       throw new Error(`Field \`${key}\` must be a finite number.`);
     }
-    result[key] = clampParam(key, rawValue);
+    parameters[key] = clampParam(key, rawValue);
   }
 
-  return result;
+  let editSummary: string | undefined;
+  if (EDIT_SUMMARY_KEY in record) {
+    const summary = record[EDIT_SUMMARY_KEY];
+    if (summary === null || summary === undefined) {
+      editSummary = undefined;
+    } else if (typeof summary !== "string") {
+      throw new Error("Field `edit_summary` must be a string when present.");
+    } else {
+      const trimmed = summary.trim();
+      editSummary = trimmed ? trimmed.slice(0, 160) : undefined;
+    }
+  }
+
+  return { parameters, editSummary };
+}
+
+export function parseEditParameters(value: unknown): EditParameters {
+  return parseEditResponse(value).parameters;
 }
 
 function clampParam(key: EditParameterKey, value: number): number {

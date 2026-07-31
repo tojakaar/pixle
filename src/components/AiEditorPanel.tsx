@@ -32,10 +32,10 @@ export function AiEditorPanel({
     setStatus(null);
 
     try {
-      const next = await editFromPrompt(trimmed, params, imageAnalysis);
-      onApply(next);
+      const result = await editFromPrompt(trimmed, params, imageAnalysis);
+      onApply(result.parameters);
       setPrompt("");
-      setStatus("Applied to sliders");
+      setStatus(result.editSummary?.trim() || "Applied to sliders");
     } catch {
       setStatus("Could not apply that edit");
     } finally {
@@ -47,7 +47,11 @@ export function AiEditorPanel({
     <section className="ai-panel" aria-label="AI editing">
       <header className="ai-panel__header">
         <h2 className="ai-panel__title">Ask pixle</h2>
-        {status ? <span className="ai-panel__status">{status}</span> : null}
+        {status ? (
+          <span className="ai-panel__status" title={status}>
+            {status}
+          </span>
+        ) : null}
       </header>
 
       <form className="ai-panel__form" onSubmit={handleSubmit}>
@@ -59,7 +63,7 @@ export function AiEditorPanel({
           placeholder={
             disabled
               ? "Open an image to edit with AI"
-              : 'Try “make it brighter” or “recover the highlights”'
+              : 'Try “cinematic”, “warm sunset”, or “recover the highlights”'
           }
           onChange={(e) => setPrompt(e.currentTarget.value)}
           aria-label="Edit instruction"
