@@ -79,8 +79,29 @@ struct AnthropicContentBlock {
     text: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct GeminiGenerateContentResponse {
+    candidates: Option<Vec<GeminiCandidate>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiCandidate {
+    content: Option<GeminiContent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiContent {
+    parts: Option<Vec<GeminiPart>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiPart {
+    text: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LlmProvider {
+    Gemini,
     OpenAi,
     Anthropic,
 }
@@ -133,10 +154,11 @@ pub struct EditFromPromptResult {
     pub edit_summary: Option<String>,
 }
 
-/// Interpret a natural-language edit prompt via OpenAI-compatible or Anthropic APIs.
+/// Interpret a natural-language edit prompt via Gemini, Anthropic, or OpenAI-compatible APIs.
 ///
-/// Credentials stay on the Rust side. Prefer `ANTHROPIC_API_KEY` for Claude, or
-/// `OPENAI_API_KEY` for OpenAI-compatible hosts. Image understanding is text metadata only.
+/// Credentials stay on the Rust side. Prefer Google AI Studio (`GEMINI_API_KEY` /
+/// `GOOGLE_API_KEY`), or use `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. Image understanding
+/// is text metadata only.
 #[tauri::command]
 pub async fn edit_from_prompt(
     prompt: String,
@@ -161,6 +183,7 @@ pub async fn edit_from_prompt(
 
     let provider = resolve_provider()?;
     let content = match provider {
+        LlmProvider::Gemini => call_gemini(&user_message).await?,
         LlmProvider::Anthropic => call_anthropic(&user_message).await?,
         LlmProvider::OpenAi => call_openai_compatible(&user_message).await?,
     };
@@ -183,31 +206,51 @@ fn resolve_provider() -> Result<LlmProvider, String> {
         .to_ascii_lowercase();
 
     match explicit.as_str() {
+        "gemini" | "google" => Ok(LlmProvider::Gemini),
         "anthropic" | "claude" => Ok(LlmProvider::Anthropic),
         "openai" => Ok(LlmProvider::OpenAi),
         "" => {
-            if env_key_usable("ANTHROPIC_API_KEY") {
+            if gemini_key_usable() {
+                Ok(LlmProvider::Gemini)
+            } else if env_key_usable("ANTHROPIC_API_KEY") {
                 Ok(LlmProvider::Anthropic)
             } else if env_key_usable("OPENAI_API_KEY") {
                 Ok(LlmProvider::OpenAi)
             } else {
                 Err(
-                    "No LLM API key found. Set ANTHROPIC_API_KEY (Claude) or OPENAI_API_KEY in `.env`, then restart the app."
+                    "No LLM API key found. Set GEMINI_API_KEY or GOOGLE_API_KEY (Google AI Studio), ANTHROPIC_API_KEY, or OPENAI_API_KEY in `.env`, then restart the app."
                         .to_string(),
                 )
             }
         }
         other => Err(format!(
-            "Unknown LLM_PROVIDER `{other}`. Use `anthropic` or `openai`."
+            "Unknown LLM_PROVIDER `{other}`. Use `gemini`, `anthropic`, or `openai`."
         )),
     }
+}
+
+fn gemini_key_usable() -> bool {
+    env_key_usable("GEMINI_API_KEY") || env_key_usable("GOOGLE_API_KEY")
+}
+
+fn require_gemini_key() -> Result<String, String> {
+    if env_key_usable("GEMINI_API_KEY") {
+        return require_env_key("GEMINI_API_KEY");
+    }
+    if env_key_usable("GOOGLE_API_KEY") {
+        return require_env_key("GOOGLE_API_KEY");
+    }
+    Err(
+        "GEMINI_API_KEY / GOOGLE_API_KEY is not set. Add your Google AI Studio key to project-root `.env` and restart the app."
+            .to_string(),
+    )
 }
 
 fn env_key_usable(name: &str) -> bool {
     match std::env::var(name) {
         Ok(value) => {
             let trimmed = value.trim();
-            !trimmed.is_empty() && !trimmed.contains("your-key-here")
+            !trimmed.is_empty() && !looks_like_placeholder(trimmed)
         }
         Err(_) => false,
     }
@@ -223,12 +266,79 @@ fn require_env_key(name: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err(format!("{name} is empty in `.env`."));
     }
-    if trimmed.contains("your-key-here") {
+    if looks_like_placeholder(trimmed) {
         return Err(format!(
             "{name} still looks like the placeholder. Set your real key in `.env`."
         ));
     }
     Ok(trimmed.to_string())
+}
+
+fn looks_like_placeholder(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("your-key-here")
+        || lower.contains("your-google-ai-studio-key-here")
+        || lower.contains("sk-ant-your-key-here")
+        || lower.contains("placeholder")
+        || lower.contains("paste-your")
+}
+
+async fn call_gemini(user_message: &str) -> Result<String, String> {
+    let api_key = require_gemini_key()?;
+    let base_url = std::env::var("GEMINI_BASE_URL")
+        .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string());
+    let model = std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".to_string());
+
+    // Google AI Studio: POST /v1beta/models/{model}:generateContent
+    let endpoint = format!(
+        "{}/v1beta/models/{}:generateContent",
+        base_url.trim_end_matches('/'),
+        model.trim()
+    );
+
+    let body = json!({
+        "system_instruction": {
+            "parts": [{ "text": SYSTEM_PROMPT }]
+        },
+        "contents": [{
+            "role": "user",
+            "parts": [{ "text": user_message }]
+        }],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json"
+        }
+    });
+
+    let client = http_client()?;
+    let response = client
+        .post(&endpoint)
+        .header("x-goog-api-key", api_key)
+        .header(CONTENT_TYPE, "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Gemini API request failed: {e}"))?;
+
+    let response_text = read_success_body(response).await?;
+    let message: GeminiGenerateContentResponse =
+        serde_json::from_str(&response_text).map_err(|e| {
+            format!(
+                "Invalid Gemini response envelope: {e}. Body: {}",
+                truncate_for_error(&response_text)
+            )
+        })?;
+
+    message
+        .candidates
+        .as_ref()
+        .and_then(|candidates| candidates.first())
+        .and_then(|candidate| candidate.content.as_ref())
+        .and_then(|content| content.parts.as_ref())
+        .and_then(|parts| parts.iter().find_map(|part| part.text.as_ref()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "Gemini API returned no text content.".to_string())
 }
 
 async fn call_openai_compatible(user_message: &str) -> Result<String, String> {
