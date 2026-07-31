@@ -9,13 +9,15 @@ interface ImageViewportProps {
   /** Original, unmodified pixel buffer. Never written to. */
   source: ImageData | null;
   params: EditParameters;
+  /** Opens the JPEG/PNG file picker from the empty state. */
+  onOpenImage: () => void;
 }
 
 /**
  * Centres the photo in the available space and draws a non-destructive preview
  * produced by the rendering engine.
  */
-export function ImageViewport({ source, params }: ImageViewportProps) {
+export function ImageViewport({ source, params, onOpenImage }: ImageViewportProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -38,7 +40,16 @@ export function ImageViewport({ source, params }: ImageViewportProps) {
   if (!source) {
     return (
       <div className="viewport viewport--empty">
-        <p className="viewport__hint">Open a JPEG or PNG to begin editing</p>
+        <div className="viewport__empty-card">
+          <p className="viewport__hint">Open a JPEG or PNG to begin editing</p>
+          <button
+            type="button"
+            className="viewport__open"
+            onClick={onOpenImage}
+          >
+            Open Image
+          </button>
+        </div>
       </div>
     );
   }

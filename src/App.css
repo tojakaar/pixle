@@ -243,10 +243,42 @@ input {
   color: var(--hint);
 }
 
+.viewport__empty-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  padding: 1.75rem 2rem;
+  border: 1px dashed color-mix(in srgb, var(--hint) 55%, transparent);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  text-align: center;
+}
+
 .viewport__hint {
   margin: 0;
   font-size: 0.95rem;
   letter-spacing: 0.01em;
+}
+
+.viewport__open {
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-radius: 8px;
+  padding: 0.7rem 1.35rem;
+  background: var(--accent);
+  color: #f7faf9;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 160ms ease, transform 160ms ease;
+}
+
+.viewport__open:hover {
+  background: var(--accent-hover);
+}
+
+.viewport__open:active {
+  transform: translateY(1px);
 }
 
 .viewport__canvas {

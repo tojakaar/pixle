@@ -68,6 +68,10 @@ function App() {
     }
   }
 
+  function openImagePicker() {
+    fileInputRef.current?.click();
+  }
+
   return (
     <div className="app">
       <header className="toolbar">
@@ -83,9 +87,9 @@ function App() {
           <button
             type="button"
             className="toolbar__open"
-            onClick={() => fileInputRef.current?.click()}
+            onClick={openImagePicker}
           >
-            Open image
+            Open Image
           </button>
           {fileName ? (
             <span className="toolbar__filename" title={fileName}>
@@ -97,7 +101,11 @@ function App() {
 
       <div className="workspace">
         <div className="workspace__main">
-          <ImageViewport source={source} params={previewParams} />
+          <ImageViewport
+            source={source}
+            params={previewParams}
+            onOpenImage={openImagePicker}
+          />
           <AiEditorPanel
             params={params}
             imageAnalysis={imageAnalysis}
