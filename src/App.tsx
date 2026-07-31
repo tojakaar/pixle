@@ -4,7 +4,9 @@ import { EditPanel } from "./components/EditPanel";
 import { ImageViewport } from "./components/ImageViewport";
 import {
   DEFAULT_EDIT_PARAMETERS,
+  analyzeImage,
   type EditParameters,
+  type ImageAnalysis,
 } from "./engine";
 import "./App.css";
 
@@ -27,6 +29,9 @@ async function decodeImageFile(file: File): Promise<ImageData> {
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [source, setSource] = useState<ImageData | null>(null);
+  const [imageAnalysis, setImageAnalysis] = useState<ImageAnalysis | null>(
+    null,
+  );
   const [fileName, setFileName] = useState<string | null>(null);
   const [params, setParams] = useState<EditParameters>({
     ...DEFAULT_EDIT_PARAMETERS,
@@ -49,7 +54,9 @@ function App() {
 
     try {
       const imageData = await decodeImageFile(file);
+      const analysis = await analyzeImage(imageData);
       setSource(imageData);
+      setImageAnalysis(analysis);
       setFileName(file.name);
       setParams({ ...DEFAULT_EDIT_PARAMETERS });
     } catch {
@@ -93,6 +100,7 @@ function App() {
           <ImageViewport source={source} params={previewParams} />
           <AiEditorPanel
             params={params}
+            imageAnalysis={imageAnalysis}
             disabled={!source}
             onApply={setParams}
           />

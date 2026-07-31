@@ -1,19 +1,21 @@
 import { useState, type FormEvent } from "react";
 import { editFromPrompt } from "../aiEditor";
-import type { EditParameters } from "../engine";
+import type { EditParameters, ImageAnalysis } from "../engine";
 
 interface AiEditorPanelProps {
   params: EditParameters;
+  imageAnalysis: ImageAnalysis | null;
   disabled: boolean;
   onApply: (params: EditParameters) => void;
 }
 
 /**
- * Conversational edit controls. Talks to `editFromPrompt` only — the mock or a
- * future OpenAI-compatible backend can be swapped in `aiEditor.ts`.
+ * Conversational edit controls. Talks to `editFromPrompt` only — LLM access
+ * stays in the Tauri backend so the API key never reaches the webview.
  */
 export function AiEditorPanel({
   params,
+  imageAnalysis,
   disabled,
   onApply,
 }: AiEditorPanelProps) {
@@ -24,13 +26,13 @@ export function AiEditorPanel({
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     const trimmed = prompt.trim();
-    if (!trimmed || disabled || busy) return;
+    if (!trimmed || disabled || busy || !imageAnalysis) return;
 
     setBusy(true);
     setStatus(null);
 
     try {
-      const next = await editFromPrompt(trimmed, params);
+      const next = await editFromPrompt(trimmed, params, imageAnalysis);
       onApply(next);
       setPrompt("");
       setStatus("Applied to sliders");
@@ -65,7 +67,7 @@ export function AiEditorPanel({
         <button
           type="submit"
           className="ai-panel__send"
-          disabled={disabled || busy || !prompt.trim()}
+          disabled={disabled || busy || !prompt.trim() || !imageAnalysis}
         >
           {busy ? "Sending…" : "Send"}
         </button>

@@ -3,6 +3,7 @@ import {
   EDIT_SLIDER_CONFIG,
   type EditParameterKey,
   type EditParameters,
+  type ImageAnalysis,
 } from "./engine";
 
 const EDIT_PARAMETER_KEYS: EditParameterKey[] = [
@@ -20,11 +21,14 @@ const EDIT_PARAMETER_KEYS: EditParameterKey[] = [
  *
  * Calls the Tauri/Rust backend, which talks to an OpenAI-compatible API using
  * server-side environment variables. The API key never enters the frontend.
+ * Image understanding is provided as compact local `ImageAnalysis` metadata —
+ * never full-resolution pixels.
  * The UI depends only on this function signature.
  */
 export async function editFromPrompt(
   prompt: string,
   currentParameters: EditParameters,
+  imageAnalysis: ImageAnalysis,
 ): Promise<EditParameters> {
   const trimmed = prompt.trim();
   if (!trimmed) {
@@ -36,6 +40,7 @@ export async function editFromPrompt(
     raw = await invoke<unknown>("edit_from_prompt", {
       prompt: trimmed,
       currentParameters,
+      imageAnalysis,
     });
   } catch (error) {
     throw new Error(formatInvokeError(error));

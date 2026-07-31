@@ -16,6 +16,42 @@ pub struct EditParameters {
     pub saturation: f64,
 }
 
+/// Compact local image-analysis metadata from the frontend.
+/// Used only as LLM prompt context — never as model output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAnalysis {
+    pub width: u32,
+    pub height: u32,
+    pub brightness_histogram: Vec<f64>,
+    pub average_colour_temperature_kelvin: f64,
+    pub colour_temperature_label: String,
+    pub dominant_colours: Vec<DominantColour>,
+    pub highlight_clipping_percent: f64,
+    pub shadow_clipping_percent: f64,
+    pub faces: Option<Vec<DetectedFace>>,
+    pub face_detection_available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DominantColour {
+    pub hex: String,
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub coverage_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectedFace {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
@@ -34,7 +70,12 @@ struct ChatMessage {
 const SYSTEM_PROMPT: &str = r#"You are a professional photo editor for Pixle.
 You make tasteful, technically sound non-destructive adjustments using slider parameters only. You never modify, generate, describe as binary, or return image data.
 
-Given the user's instruction and the current EditParameters, return the full updated EditParameters as a single JSON object. Treat the current values as the baseline and apply incremental changes from there.
+You are given:
+1. Local ImageAnalysis metadata (histogram, colour temperature, dominant colours, clipping, dimensions, faces when available). Use it to understand the scene before adjusting.
+2. The current EditParameters (baseline). Apply incremental changes from these values.
+3. The user's natural-language instruction.
+
+Return the full updated EditParameters as a single JSON object.
 
 Rules:
 - Respond with JSON only. No markdown, no commentary.
@@ -48,18 +89,21 @@ Rules:
   - tint: -100 to 100 (negative green, positive magenta)
   - saturation: -100 to 100
 - Prefer moderate, photographically natural adjustments relative to the current values unless the user asks to reset or go extreme.
+- Let analysis guide decisions: high highlight clipping → pull highlights; crushed shadows → lift shadows; warm/cool Kelvin → temperature; faces present → protect skin (avoid extreme saturation/temperature).
 - Balance related controls when appropriate (e.g. brightening may slightly lift shadows; warming may need a small tint nudge).
 - If the instruction is unrelated to photo adjustments, return the current parameters unchanged.
+- Never return image pixels, histograms, or analysis fields — EditParameters only.
 "#;
 
 /// Interpret a natural-language edit prompt via an OpenAI-compatible chat API.
 ///
 /// Credentials stay on the Rust side (`OPENAI_API_KEY` and optional
-/// `OPENAI_BASE_URL` / `OPENAI_MODEL`). Nothing image-related is sent.
+/// `OPENAI_BASE_URL` / `OPENAI_MODEL`). Image understanding is text metadata only.
 #[tauri::command]
 pub async fn edit_from_prompt(
     prompt: String,
     current_parameters: EditParameters,
+    image_analysis: ImageAnalysis,
 ) -> Result<EditParameters, String> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
@@ -78,11 +122,15 @@ pub async fn edit_from_prompt(
 
     let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
 
+    let analysis_json = serde_json::to_string_pretty(&image_analysis)
+        .map_err(|e| format!("Failed to serialize image analysis: {e}"))?;
+    let params_json = serde_json::to_string_pretty(&current_parameters)
+        .map_err(|e| format!("Failed to serialize current parameters: {e}"))?;
+
     let user_message = format!(
-        "Current EditParameters JSON:\n{}\n\nUser instruction:\n{}",
-        serde_json::to_string_pretty(&current_parameters)
-            .map_err(|e| format!("Failed to serialize current parameters: {e}"))?,
-        trimmed
+        "ImageAnalysis JSON (local metadata only — not an image):\n{analysis_json}\n\n\
+         Current EditParameters JSON:\n{params_json}\n\n\
+         User instruction:\n{trimmed}"
     );
 
     let body = json!({
@@ -249,6 +297,27 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn sample_analysis() -> ImageAnalysis {
+        ImageAnalysis {
+            width: 100,
+            height: 80,
+            brightness_histogram: vec![3.0; 32],
+            average_colour_temperature_kelvin: 5600.0,
+            colour_temperature_label: "neutral daylight".into(),
+            dominant_colours: vec![DominantColour {
+                hex: "#808080".into(),
+                r: 128,
+                g: 128,
+                b: 128,
+                coverage_percent: 40.0,
+            }],
+            highlight_clipping_percent: 1.5,
+            shadow_clipping_percent: 2.0,
+            faces: None,
+            face_detection_available: false,
+        }
+    }
+
     #[test]
     fn accepts_valid_parameters() {
         let value = json!({
@@ -322,6 +391,15 @@ mod tests {
         assert_eq!(parsed.contrast, -100.0);
     }
 
+    #[test]
+    fn image_analysis_serializes_without_pixels() {
+        let json = serde_json::to_string(&sample_analysis()).unwrap();
+        assert!(json.contains("brightnessHistogram"));
+        assert!(json.contains("averageColourTemperatureKelvin"));
+        assert!(!json.contains("imageBase64"));
+        assert!(!json.contains("pixels"));
+    }
+
     #[tokio::test]
     async fn openapi_compatible_roundtrip_against_env_endpoint() {
         // Opt-in smoke test: OPENAI_API_KEY + OPENAI_BASE_URL must be set
@@ -339,7 +417,7 @@ mod tests {
             tint: 0.0,
             saturation: 0.0,
         };
-        let next = edit_from_prompt("make it brighter".into(), current)
+        let next = edit_from_prompt("make it brighter".into(), current, sample_analysis())
             .await
             .expect("live AI edit should succeed");
         assert!(next.exposure > 0.0);
