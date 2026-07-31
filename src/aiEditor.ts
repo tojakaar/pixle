@@ -1,28 +1,84 @@
+import { invoke } from "@tauri-apps/api/core";
 import {
   EDIT_SLIDER_CONFIG,
   type EditParameterKey,
   type EditParameters,
 } from "./engine";
 
+const EDIT_PARAMETER_KEYS: EditParameterKey[] = [
+  "exposure",
+  "contrast",
+  "highlights",
+  "shadows",
+  "temperature",
+  "tint",
+  "saturation",
+];
+
 /**
  * Conversational photo-edit interface.
  *
- * The UI depends only on this function signature. Replace the mock body with an
- * OpenAI-compatible API client later — no UI changes required.
+ * Calls the Tauri/Rust backend, which talks to an OpenAI-compatible API using
+ * server-side environment variables. The API key never enters the frontend.
+ * The UI depends only on this function signature.
  */
 export async function editFromPrompt(
   prompt: string,
   currentParameters: EditParameters,
 ): Promise<EditParameters> {
-  // Simulate a short network round-trip so the UI can show a pending state.
-  await delay(180);
-  return applyMockInstructions(prompt, currentParameters);
+  const trimmed = prompt.trim();
+  if (!trimmed) {
+    throw new Error("Prompt must not be empty.");
+  }
+
+  let raw: unknown;
+  try {
+    raw = await invoke<unknown>("edit_from_prompt", {
+      prompt: trimmed,
+      currentParameters,
+    });
+  } catch (error) {
+    throw new Error(formatInvokeError(error));
+  }
+
+  return parseEditParameters(raw);
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    window.setTimeout(resolve, ms);
-  });
+/**
+ * Validate LLM/backend JSON before applying it to the UI.
+ * Rejects non-objects, missing keys, non-numeric values, and unexpected fields
+ * (including any attempt to return image payloads).
+ */
+export function parseEditParameters(value: unknown): EditParameters {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("EditParameters must be a JSON object.");
+  }
+
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+
+  for (const key of EDIT_PARAMETER_KEYS) {
+    if (!(key in record)) {
+      throw new Error(`Missing required field \`${key}\`.`);
+    }
+  }
+
+  for (const key of keys) {
+    if (!EDIT_PARAMETER_KEYS.includes(key as EditParameterKey)) {
+      throw new Error(`Unexpected field \`${key}\` in EditParameters.`);
+    }
+  }
+
+  const result = {} as EditParameters;
+  for (const key of EDIT_PARAMETER_KEYS) {
+    const rawValue = record[key];
+    if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) {
+      throw new Error(`Field \`${key}\` must be a finite number.`);
+    }
+    result[key] = clampParam(key, rawValue);
+  }
+
+  return result;
 }
 
 function clampParam(key: EditParameterKey, value: number): number {
@@ -35,86 +91,12 @@ function clampParam(key: EditParameterKey, value: number): number {
   return Number(clamped.toFixed(decimals));
 }
 
-function adjust(
-  params: EditParameters,
-  deltas: Partial<EditParameters>,
-): EditParameters {
-  const next: EditParameters = { ...params };
-  for (const key of Object.keys(deltas) as EditParameterKey[]) {
-    const delta = deltas[key];
-    if (delta === undefined) continue;
-    next[key] = clampParam(key, params[key] + delta);
+function formatInvokeError(error: unknown): string {
+  if (typeof error === "string" && error.trim()) {
+    return error;
   }
-  return next;
-}
-
-/**
- * Lightweight keyword matcher for local development.
- * Intentionally small and deterministic — not a real language model.
- */
-function applyMockInstructions(
-  prompt: string,
-  currentParameters: EditParameters,
-): EditParameters {
-  const text = prompt.trim().toLowerCase();
-  if (!text) {
-    return { ...currentParameters };
+  if (error instanceof Error && error.message.trim()) {
+    return error.message;
   }
-
-  let next = { ...currentParameters };
-
-  const rules: Array<{ pattern: RegExp; deltas: Partial<EditParameters> }> = [
-    {
-      pattern: /\b(brighter|brighten|increase exposure|more exposure|lighten)\b/,
-      deltas: { exposure: 0.4 },
-    },
-    {
-      pattern: /\b(darker|darken|decrease exposure|less exposure|dimmer)\b/,
-      deltas: { exposure: -0.4 },
-    },
-    {
-      pattern: /\b(warmer|warm(?:\s+tones?)?|increase temperature)\b/,
-      deltas: { temperature: 25 },
-    },
-    {
-      pattern: /\b(cooler|colder|cool(?:\s+tones?)?|decrease temperature)\b/,
-      deltas: { temperature: -25 },
-    },
-    {
-      pattern:
-        /\b(recover(?:\s+the)?\s+highlights?|pull(?:\s+back)?\s+highlights?|fix\s+highlights?)\b/,
-      deltas: { highlights: -30 },
-    },
-    {
-      pattern: /\b(increase contrast|more contrast|boost contrast)\b/,
-      deltas: { contrast: 25 },
-    },
-    {
-      pattern: /\b(decrease contrast|less contrast|lower contrast)\b/,
-      deltas: { contrast: -25 },
-    },
-    {
-      pattern:
-        /\b(more vibrant|increase saturation|more saturated|boost(?:\s+the)?\s+colors?|vibran(?:t|ce))\b/,
-      deltas: { saturation: 30 },
-    },
-    {
-      pattern:
-        /\b(less vibrant|decrease saturation|desaturate|more muted|mute(?:d)?\s+colors?)\b/,
-      deltas: { saturation: -30 },
-    },
-    {
-      pattern:
-        /\b(lift(?:\s+the)?\s+shadows?|open(?:\s+up)?\s+shadows?|recover(?:\s+the)?\s+shadows?)\b/,
-      deltas: { shadows: 30 },
-    },
-  ];
-
-  for (const rule of rules) {
-    if (rule.pattern.test(text)) {
-      next = adjust(next, rule.deltas);
-    }
-  }
-
-  return next;
+  return "AI edit request failed.";
 }

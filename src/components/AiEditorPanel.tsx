@@ -9,8 +9,8 @@ interface AiEditorPanelProps {
 }
 
 /**
- * Conversational edit controls. Talks to `editFromPrompt` only — the mock or a
- * future OpenAI-compatible backend can be swapped in `aiEditor.ts`.
+ * Conversational edit controls. Talks only to `editFromPrompt` — LLM access
+ * stays in the Tauri backend so the API key never reaches the webview.
  */
 export function AiEditorPanel({
   params,
@@ -20,6 +20,7 @@ export function AiEditorPanel({
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [statusTone, setStatusTone] = useState<"ok" | "error">("ok");
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -33,9 +34,15 @@ export function AiEditorPanel({
       const next = await editFromPrompt(trimmed, params);
       onApply(next);
       setPrompt("");
+      setStatusTone("ok");
       setStatus("Applied to sliders");
-    } catch {
-      setStatus("Could not apply that edit");
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message.trim()
+          ? error.message
+          : "Could not apply that edit";
+      setStatusTone("error");
+      setStatus(message);
     } finally {
       setBusy(false);
     }
@@ -45,7 +52,18 @@ export function AiEditorPanel({
     <section className="ai-panel" aria-label="AI editing">
       <header className="ai-panel__header">
         <h2 className="ai-panel__title">Ask pixle</h2>
-        {status ? <span className="ai-panel__status">{status}</span> : null}
+        {status ? (
+          <span
+            className={
+              statusTone === "error"
+                ? "ai-panel__status ai-panel__status--error"
+                : "ai-panel__status"
+            }
+            title={status}
+          >
+            {status}
+          </span>
+        ) : null}
       </header>
 
       <form className="ai-panel__form" onSubmit={handleSubmit}>

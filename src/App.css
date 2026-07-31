@@ -179,8 +179,16 @@ input {
 }
 
 .ai-panel__status {
+  max-width: min(52vw, 28rem);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 0.8rem;
   color: var(--accent);
+}
+
+.ai-panel__status--error {
+  color: #a33b2d;
 }
 
 .ai-panel__form {
