@@ -27,3 +27,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Tauri / Xcode local artefacts (generated on macOS via `tauri ios init`)
+src-tauri/gen/apple/**/DerivedData/
+src-tauri/gen/apple/**/build/
+src-tauri/target/

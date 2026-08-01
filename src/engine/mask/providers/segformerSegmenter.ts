@@ -7,8 +7,15 @@ import {
 import type { Mask, MaskBounds, MaskCollection } from "../types";
 import { emptyMaskCollection } from "../types";
 import { perfLog, perfTime } from "../../perf";
+import {
+  recordFeasibilityMetric,
+  sampleJsHeap,
+} from "../../../platform/feasibilityMetrics";
 
 const MODEL_ID = "Xenova/segformer-b0-finetuned-ade-512-512";
+
+/** Tracks first vs warm inference for the iOS feasibility spike. */
+let firstInferDone = false;
 
 /** Soft edge radius after nearest-neighbour upsample (working-buffer pixels). */
 const FEATHER_RADIUS = 2;
@@ -72,6 +79,8 @@ async function getSegmentationPipeline(): Promise<PipelineFn> {
       loadMs = performance.now() - t0;
       end();
       perfLog(`[pixle segformer] model ready in ${loadMs.toFixed(0)}ms`);
+      recordFeasibilityMetric("segformer_load_ms", Math.round(loadMs));
+      sampleJsHeap();
       return segmenter;
     })().catch((error) => {
       pipelinePromise = null;
@@ -134,6 +143,19 @@ async function segmentWithSegformer(
     perfLog(
       `[pixle segformer] inference ${inferMs.toFixed(0)}ms → ${outputs?.length ?? 0} ADE classes`,
     );
+    if (!firstInferDone) {
+      firstInferDone = true;
+      recordFeasibilityMetric(
+        "segformer_first_infer_ms",
+        Math.round(inferMs),
+      );
+    } else {
+      recordFeasibilityMetric(
+        "segformer_warm_infer_ms",
+        Math.round(inferMs),
+      );
+    }
+    sampleJsHeap();
 
     return buildPixleMasks(outputs ?? [], width, height);
   } catch (error) {

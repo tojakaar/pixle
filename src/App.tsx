@@ -1,5 +1,5 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import { editFromPrompt, type EditFromPromptResult } from "./aiEditor";
+import type { EditFromPromptResult } from "./aiEditor";
 import {
   AiEditorPanel,
   type AiPromptResult,
@@ -9,9 +9,16 @@ import { ImageViewport } from "./components/ImageViewport";
 import { RightSidebar } from "./components/RightSidebar";
 import { UnsavedChangesModal } from "./components/UnsavedChangesModal";
 import {
-  chooseExportDestination,
-  writeExport,
-} from "./exportFile";
+  getPlatformServices,
+  getPlatformServicesSync,
+  probeWasmCapabilities,
+  recordAppLaunch,
+  recordFeasibilityMetric,
+  resolvePickedFile,
+  sampleJsHeap,
+  setFeasibilityPlatform,
+  type PlatformServices,
+} from "./platform";
 import {
   BUILTIN_LOOKS,
   DEFAULT_EDIT_PARAMETERS,
@@ -80,6 +87,11 @@ interface LastEditSession {
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const viewportShellRef = useRef<HTMLDivElement>(null);
+  const platformRef = useRef<PlatformServices>(getPlatformServicesSync());
+  const [platform, setPlatform] = useState<PlatformServices>(
+    () => platformRef.current,
+  );
+  const [mobilePanelOpen, setMobilePanelOpen] = useState(false);
   /** Monotonic open request id — newest open always wins. */
   const openRequestIdRef = useRef(0);
   const openAbortRef = useRef<AbortController | null>(null);
@@ -183,6 +195,22 @@ function App() {
     () => groupActionsForHistory(editSession.actions),
     [editSession.actions],
   );
+
+  useEffect(() => {
+    let cancelled = false;
+    void getPlatformServices().then((services) => {
+      if (cancelled) return;
+      platformRef.current = services;
+      setPlatform(services);
+      setFeasibilityPlatform(services.platform);
+      probeWasmCapabilities();
+      recordAppLaunch();
+      sampleJsHeap();
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function isCurrentOpen(requestId: number): boolean {
     return requestId === openRequestIdRef.current;
@@ -353,7 +381,12 @@ function App() {
     setOpenRequestId(requestId);
     const endOpen = perfTime(`open image pipeline #${requestId}`);
     const endPlaceholder = perfTime(`placeholder create #${requestId}`);
-    openLog(requestId, "open start", { name: file.name, size: file.size });
+    const openStarted = performance.now();
+    openLog(requestId, "open start", {
+      name: file.name,
+      size: file.size,
+      platform: platformRef.current.platform,
+    });
 
     // Create the new placeholder BEFORE clearing the old canvas source.
     // Never revoke the previous URL synchronously while an <img> may still use it.
@@ -365,6 +398,10 @@ function App() {
     }
 
     setPlaceholderUrl(objectUrl);
+    recordFeasibilityMetric(
+      "placeholder_ms",
+      Math.round(performance.now() - openStarted),
+    );
     setSource(null);
     setSourceFile(file);
     setFileName(file.name);
@@ -433,6 +470,11 @@ function App() {
       // Clearing it here unmounted the placeholder before putImageData → black flash.
       setSource(decoded.working);
       setImageAnalysis(quickAnalysis);
+      recordFeasibilityMetric(
+        "preview_ready_ms",
+        Math.round(performance.now() - openStarted),
+      );
+      sampleJsHeap();
       openLog(requestId, "working buffer ready; awaiting canvas paint", {
         w: decoded.working.width,
         h: decoded.working.height,
@@ -522,13 +564,20 @@ function App() {
   }
 
   function requestOpenFile(file: File): void {
-    const accepted =
-      file.type === "image/jpeg" ||
-      file.type === "image/png" ||
-      /\.(jpe?g|png)$/i.test(file.name);
-
-    if (!accepted) {
-      window.alert("Please choose a JPEG or PNG image.");
+    const picker = platformRef.current.imagePicker;
+    if (!picker.acceptsFile(file)) {
+      const meta = platformRef.current.describeFile(file);
+      if (meta.isHeic && !picker.supportsHeic) {
+        window.alert(
+          "HEIC is not supported on this platform build. Export as JPEG from Photos, or run the iOS spike build.",
+        );
+        return;
+      }
+      window.alert(
+        picker.supportsHeic
+          ? "Please choose a JPEG, PNG, or HEIC image."
+          : "Please choose a JPEG or PNG image.",
+      );
       return;
     }
 
@@ -547,15 +596,36 @@ function App() {
   }
 
   function handleFileChange(fileList: FileList | null) {
-    const file = fileList?.[0];
     // Allow replacing an image while prepare is running; only block during export.
-    if (!file || exportingRef.current) return;
-    requestOpenFile(file);
+    if (exportingRef.current) return;
+    const picked = resolvePickedFile(platformRef.current.imagePicker, fileList);
+    if (picked.status === "cancelled") return;
+    if (picked.status === "denied") {
+      setExportTone("error");
+      setExportStatus(picked.message);
+      return;
+    }
+    if (picked.status === "error") {
+      window.alert(picked.message);
+      return;
+    }
+    requestOpenFile(picked.file);
   }
 
   function openImagePicker() {
     if (exportingRef.current || unsavedBusy) return;
-    fileInputRef.current?.click();
+    void platformRef.current.imagePicker.pickImage({
+      triggerFileInput: () => fileInputRef.current?.click(),
+    }).then((result) => {
+      if (result.status === "denied") {
+        setExportTone("error");
+        setExportStatus(result.message);
+      } else if (result.status === "error") {
+        setExportTone("error");
+        setExportStatus(result.message);
+      }
+      // "cancelled" is expected when the HTML input owns the selection.
+    });
   }
 
   function handleUnsavedCancel() {
@@ -965,7 +1035,7 @@ function App() {
     }
 
     // 3) Gemini with compact EditSession context.
-    const result = await editFromPrompt(
+    const result = await platformRef.current.apiClient.editFromPrompt(
       trimmed,
       presentRef.current.parameters,
       imageAnalysis,
@@ -1124,12 +1194,15 @@ function App() {
       // Keep the UI interactive while the native save dialog is open. Disabling
       // controls for the dialog itself left the app unclickable after cancel /
       // save on some Tauri webviews (stuck disabled + lost focus/pointer).
-      destination = await chooseExportDestination(exportOptions);
+      destination =
+        await platformRef.current.imageExporter.chooseDestination(exportOptions);
     } catch (error) {
       const message =
         error instanceof Error && error.message.trim()
           ? error.message
-          : "Could not open the save dialog.";
+          : platformRef.current.platform === "ios"
+            ? "Could not prepare Photos export."
+            : "Could not open the save dialog.";
       setExportTone("error");
       setExportStatus(message);
       return { status: "error", message };
@@ -1144,7 +1217,10 @@ function App() {
     setExporting(true);
 
     try {
-      const result = await writeExport(exportOptions, destination);
+      const result = await platformRef.current.imageExporter.write(
+        exportOptions,
+        destination,
+      );
 
       if (result.status === "cancelled") {
         setExportStatus(null);
@@ -1153,7 +1229,11 @@ function App() {
 
       setExportTone("ok");
       const shortName = result.path.split(/[/\\]/).pop() ?? result.path;
-      setExportStatus(`Saved ${shortName}`);
+      setExportStatus(
+        platformRef.current.platform === "ios"
+          ? `Saved to ${shortName}`
+          : `Saved ${shortName}`,
+      );
       markClean(presentRef.current);
       return { status: "saved" };
     } catch (error) {
@@ -1218,16 +1298,34 @@ function App() {
   const controlsDisabled = !source || preparing || exporting || unsavedBusy;
   const canSaveLook =
     imageReady && !parametersEqual(params, DEFAULT_EDIT_PARAMETERS);
+  const isCompactShell =
+    platform.platform === "ios" || platform.platform === "android";
+  const exportLabel =
+    platform.platform === "ios"
+      ? exporting
+        ? "Saving…"
+        : "Save to Photos"
+      : exporting
+        ? "Exporting…"
+        : "Export";
 
   return (
-    <div className="app">
+    <div
+      className={
+        isCompactShell
+          ? mobilePanelOpen
+            ? "app app--compact app--panel-open"
+            : "app app--compact"
+          : "app"
+      }
+    >
       <header className="toolbar">
         <div className="toolbar__brand">pixle</div>
         <div className="toolbar__actions">
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/jpeg,image/png,.jpg,.jpeg,.png"
+            accept={platform.imagePicker.acceptAttribute}
             className="toolbar__file-input"
             onChange={(e) => handleFileChange(e.currentTarget.files)}
           />
@@ -1237,7 +1335,7 @@ function App() {
             disabled={exporting || unsavedBusy}
             onClick={openImagePicker}
           >
-            Open Image
+            {platform.platform === "ios" ? "Photos" : "Open Image"}
           </button>
           {fileName ? (
             <span className="toolbar__filename" title={fileName}>
@@ -1284,7 +1382,7 @@ function App() {
             disabled={!imageReady || exporting || unsavedBusy}
             onClick={handleExport}
           >
-            {exporting ? "Exporting…" : "Export"}
+            {exportLabel}
           </button>
         </div>
       </header>
@@ -1326,23 +1424,73 @@ function App() {
             disabled={controlsDisabled}
             onSubmitPrompt={handleAiPrompt}
           />
+          {isCompactShell ? (
+            <div className="mobile-chrome">
+              <button
+                type="button"
+                className="mobile-chrome__adjust"
+                disabled={!hasDocument || exporting || unsavedBusy}
+                aria-expanded={mobilePanelOpen}
+                onClick={() => setMobilePanelOpen((open) => !open)}
+              >
+                {mobilePanelOpen ? "Close adjustments" : "Adjust"}
+              </button>
+            </div>
+          ) : null}
         </div>
-        <RightSidebar
-          params={params}
-          disabled={controlsDisabled}
-          onChange={setParamsLive}
-          onReset={handleReset}
-          intensity={lastEdit ? lastEdit.intensity : null}
-          onIntensityChange={handleIntensityChange}
-          actionGroups={actionGroups}
-          activeActionId={editSession.activeActionId}
-          onSelectAction={handleSelectAction}
-          builtinLooks={BUILTIN_LOOKS}
-          customLooks={customLooks}
-          canSaveLook={canSaveLook}
-          onSaveLook={handleSaveLook}
-          onApplyLook={handleApplyLook}
-        />
+        {isCompactShell ? (
+          <>
+            {mobilePanelOpen ? (
+              <button
+                type="button"
+                className="mobile-sheet__backdrop"
+                aria-label="Close adjustments"
+                onClick={() => setMobilePanelOpen(false)}
+              />
+            ) : null}
+            <div
+              className={
+                mobilePanelOpen
+                  ? "mobile-sheet mobile-sheet--open"
+                  : "mobile-sheet"
+              }
+            >
+              <RightSidebar
+                params={params}
+                disabled={controlsDisabled}
+                onChange={setParamsLive}
+                onReset={handleReset}
+                intensity={lastEdit ? lastEdit.intensity : null}
+                onIntensityChange={handleIntensityChange}
+                actionGroups={actionGroups}
+                activeActionId={editSession.activeActionId}
+                onSelectAction={handleSelectAction}
+                builtinLooks={BUILTIN_LOOKS}
+                customLooks={customLooks}
+                canSaveLook={canSaveLook}
+                onSaveLook={handleSaveLook}
+                onApplyLook={handleApplyLook}
+              />
+            </div>
+          </>
+        ) : (
+          <RightSidebar
+            params={params}
+            disabled={controlsDisabled}
+            onChange={setParamsLive}
+            onReset={handleReset}
+            intensity={lastEdit ? lastEdit.intensity : null}
+            onIntensityChange={handleIntensityChange}
+            actionGroups={actionGroups}
+            activeActionId={editSession.activeActionId}
+            onSelectAction={handleSelectAction}
+            builtinLooks={BUILTIN_LOOKS}
+            customLooks={customLooks}
+            canSaveLook={canSaveLook}
+            onSaveLook={handleSaveLook}
+            onApplyLook={handleApplyLook}
+          />
+        )}
       </div>
 
       <UnsavedChangesModal

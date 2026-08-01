@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:js": "node scripts/verify-edit-session.mjs && node scripts/verify-platform.mjs && npx tsx scripts/sky-smoke.mts && npx tsx scripts/segformer-smoke.mts",
+    "test:segformer:smoke": "npx tsx scripts/segformer-smoke.mts",
+    "test:segformer:real": "npx tsx scripts/segformer-real-smoke.mts",
+    "ios:check": "node -e \"const {execSync}=require('child_process'); try { const h=execSync('npx tauri ios --help',{encoding:'utf8'}); console.log(h); } catch (e) { console.log('tauri ios unavailable on this host (expected on Linux). Run on macOS: npx tauri ios init'); process.exit(0); }\""
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
