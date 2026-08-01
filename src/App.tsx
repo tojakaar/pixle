@@ -3,6 +3,7 @@ import { AiEditorPanel } from "./components/AiEditorPanel";
 import { ImageToolbar } from "./components/ImageToolbar";
 import { ImageViewport } from "./components/ImageViewport";
 import { RightSidebar } from "./components/RightSidebar";
+import { UnsavedChangesModal } from "./components/UnsavedChangesModal";
 import {
   chooseExportDestination,
   writeExport,
@@ -32,7 +33,7 @@ import {
   type PreviewSizeHint,
 } from "./engine";
 import { isAbortError, openLog } from "./engine/openLog";
-import { perfTime } from "./engine/perf";
+import { perfLog, perfTime } from "./engine/perf";
 import { loadSavedLooks, saveLook } from "./looksStorage";
 import "./App.css";
 
@@ -58,6 +59,13 @@ function App() {
   const presentRef = useRef<EditParameters>(
     cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
   );
+  /** Parameter snapshot last marked clean (open / successful export). */
+  const cleanParamsRef = useRef<EditParameters>(
+    cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
+  );
+  /** File waiting on the unsaved-changes dialog. */
+  const pendingOpenFileRef = useRef<File | null>(null);
+
   /** Working preview buffer — set once per open; not recopied on slider moves. */
   const [source, setSource] = useState<ImageData | null>(null);
   /** Immediate object-URL preview of the selected File. */
@@ -71,6 +79,7 @@ function App() {
   );
   const [fileName, setFileName] = useState<string | null>(null);
   const [preparing, setPreparing] = useState(false);
+  const [prepareError, setPrepareError] = useState<string | null>(null);
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [exportTone, setExportTone] = useState<"ok" | "error">("ok");
@@ -85,6 +94,10 @@ function App() {
   );
   /** Bumps after export/reset so in-flight AI panels drop stale busy state. */
   const [editorSessionKey, setEditorSessionKey] = useState(0);
+  const [unsavedDialogOpen, setUnsavedDialogOpen] = useState(false);
+  const [unsavedBusy, setUnsavedBusy] = useState(false);
+  const [unsavedError, setUnsavedError] = useState<string | null>(null);
+  const [isDirty, setIsDirty] = useState(false);
 
   const params = history.present;
   presentRef.current = params;
@@ -101,11 +114,21 @@ function App() {
     return requestId === openRequestIdRef.current;
   }
 
+  function markClean(snapshot: EditParameters = presentRef.current): void {
+    cleanParamsRef.current = cloneEditParameters(snapshot);
+    setIsDirty(false);
+  }
+
   function queueRevoke(url: string | null | undefined, requestId: number): void {
     if (!url) return;
     urlsPendingRevokeRef.current.push(url);
     openLog(requestId, "queued placeholder revoke", url.slice(-18));
   }
+
+  // Keep dirty flag in sync with present vs last clean snapshot.
+  useEffect(() => {
+    setIsDirty(!parametersEqual(params, cleanParamsRef.current));
+  }, [params]);
 
   // Revoke superseded object URLs only after React commits the new placeholder.
   // This effect runs post-commit, so the visible <img> already uses the new URL.
@@ -159,21 +182,36 @@ function App() {
     };
   }
 
-  async function handleFileChange(fileList: FileList | null) {
-    const file = fileList?.[0];
-    // Allow replacing an image while prepare is running; only block during export.
-    if (!file || exportingRef.current) return;
-
-    const accepted =
-      file.type === "image/jpeg" ||
-      file.type === "image/png" ||
-      /\.(jpe?g|png)$/i.test(file.name);
-
-    if (!accepted) {
-      window.alert("Please choose a JPEG or PNG image.");
+  function handleCanvasReady(requestId: number): void {
+    if (!isCurrentOpen(requestId)) {
+      openLog(requestId, "stale canvas ready; ignore");
       return;
     }
+    setPreparing(false);
+    setPrepareError(null);
+    openLog(requestId, "preparing=false after canvas ready");
+    perfLog(`open #${requestId} handoff complete`);
+  }
 
+  function handlePlaceholderRetired(requestId: number): void {
+    if (!isCurrentOpen(requestId)) {
+      openLog(requestId, "stale placeholder retire; ignore");
+      return;
+    }
+    const url = placeholderUrlRef.current;
+    if (!url) return;
+    // Only retire the URL that belonged to this completed handoff.
+    placeholderUrlRef.current = null;
+    setPlaceholderUrl(null);
+    queueRevoke(url, requestId);
+    openLog(requestId, "placeholder cleared after fade");
+  }
+
+  /**
+   * Open a file into the editor. Callers must already have handled dirty-state
+   * confirmation — this always replaces the current document.
+   */
+  async function openImageFile(file: File): Promise<void> {
     // —— Invalidate the previous open immediately ——
     const previousAbort = openAbortRef.current;
     previousAbort?.abort();
@@ -183,6 +221,7 @@ function App() {
     const requestId = ++openRequestIdRef.current;
     setOpenRequestId(requestId);
     const endOpen = perfTime(`open image pipeline #${requestId}`);
+    const endPlaceholder = perfTime(`placeholder create #${requestId}`);
     openLog(requestId, "open start", { name: file.name, size: file.size });
 
     // Create the new placeholder BEFORE clearing the old canvas source.
@@ -202,11 +241,14 @@ function App() {
     setHistory(createEditHistory());
     setLastEdit(null);
     setExportStatus(null);
+    setPrepareError(null);
     setShowingBefore(false);
     setBeforeLatched(false);
     holdingBeforeRef.current = false;
     setEditorSessionKey((key) => key + 1);
     setPreparing(true);
+    markClean(DEFAULT_EDIT_PARAMETERS);
+    endPlaceholder();
     openLog(requestId, "placeholder ready; preparing=true");
 
     if (fileInputRef.current) {
@@ -223,50 +265,40 @@ function App() {
     try {
       const hint = measurePreviewHint();
       openLog(requestId, "decode requested", hint);
+      const endDecode = perfTime(`decodeImageFile #${requestId}`);
       const decoded = await decodeImageFile(file, {
         hint,
         signal: abortController.signal,
         requestId,
       });
+      endDecode();
 
       if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
         openLog(requestId, "stale after decode; discard ImageData");
         return;
       }
 
+      const endAnalysis = perfTime(`quickAnalysis #${requestId}`);
       const quickAnalysis = analyzeImageSync(decoded.working, {
         width: decoded.originalWidth,
         height: decoded.originalHeight,
       });
+      endAnalysis();
 
       if (!isCurrentOpen(requestId)) {
         openLog(requestId, "stale before setSource; ignore");
         return;
       }
 
+      // Keep preparing=true until ImageViewport reports the first canvas paint.
+      // Clearing it here unmounted the placeholder before putImageData → black flash.
       setSource(decoded.working);
       setImageAnalysis(quickAnalysis);
-      setPreparing(false);
-      openLog(requestId, "editable preview ready; preparing=false", {
+      openLog(requestId, "working buffer ready; awaiting canvas paint", {
         w: decoded.working.width,
         h: decoded.working.height,
       });
       endOpen();
-
-      // Drop the placeholder only after the canvas owns the view, and only if
-      // this request is still current. Revoke via the deferred queue.
-      window.requestAnimationFrame(() => {
-        if (!isCurrentOpen(requestId)) {
-          openLog(requestId, "stale before placeholder clear; ignore");
-          return;
-        }
-        if (placeholderUrlRef.current === objectUrl) {
-          placeholderUrlRef.current = null;
-          setPlaceholderUrl(null);
-          queueRevoke(objectUrl, requestId);
-          openLog(requestId, "placeholder cleared after canvas swap");
-        }
-      });
 
       await yieldToUi();
       if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
@@ -293,23 +325,20 @@ function App() {
         return;
       }
       openLog(requestId, "open failed", error);
-      // Real failure for the active request — reset to a usable empty state.
-      if (placeholderUrlRef.current === objectUrl) {
-        placeholderUrlRef.current = null;
-        setPlaceholderUrl(null);
-        queueRevoke(objectUrl, requestId);
-      }
+      // Keep the placeholder visible and the app usable — do not blank the viewport.
       setSource(null);
-      setSourceFile(null);
-      setFileName(null);
-      setImageAnalysis(null);
       setPreparing(false);
-      window.alert("Could not open that image.");
+      setPrepareError("Could not prepare that image.");
+      setExportTone("error");
+      setExportStatus("Could not prepare that image.");
     } finally {
-      // Only the active request may clear the active preparing flag.
-      if (isCurrentOpen(requestId)) {
+      // Active request: only clear preparing on failure/abort paths that never
+      // reach canvas-ready. Success clears preparing in handleCanvasReady.
+      if (isCurrentOpen(requestId) && abortController.signal.aborted) {
         setPreparing(false);
-        openLog(requestId, "loading finally; preparing=false");
+      }
+      if (isCurrentOpen(requestId)) {
+        openLog(requestId, "loading finally");
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
         }
@@ -319,9 +348,90 @@ function App() {
     }
   }
 
+  function requestOpenFile(file: File): void {
+    const accepted =
+      file.type === "image/jpeg" ||
+      file.type === "image/png" ||
+      /\.(jpe?g|png)$/i.test(file.name);
+
+    if (!accepted) {
+      window.alert("Please choose a JPEG or PNG image.");
+      return;
+    }
+
+    // Dirty document → confirm before replacing.
+    if (isDirty && sourceFile) {
+      pendingOpenFileRef.current = file;
+      setUnsavedError(null);
+      setUnsavedDialogOpen(true);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+      return;
+    }
+
+    void openImageFile(file);
+  }
+
+  function handleFileChange(fileList: FileList | null) {
+    const file = fileList?.[0];
+    // Allow replacing an image while prepare is running; only block during export.
+    if (!file || exportingRef.current) return;
+    requestOpenFile(file);
+  }
+
   function openImagePicker() {
-    if (exportingRef.current) return;
+    if (exportingRef.current || unsavedBusy) return;
     fileInputRef.current?.click();
+  }
+
+  function handleUnsavedCancel() {
+    if (unsavedBusy) return;
+    pendingOpenFileRef.current = null;
+    setUnsavedDialogOpen(false);
+    setUnsavedError(null);
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  function handleUnsavedDontSave() {
+    if (unsavedBusy) return;
+    const pending = pendingOpenFileRef.current;
+    pendingOpenFileRef.current = null;
+    setUnsavedDialogOpen(false);
+    setUnsavedError(null);
+    if (pending) {
+      void openImageFile(pending);
+    }
+  }
+
+  async function handleUnsavedSave() {
+    if (unsavedBusy) return;
+    const pending = pendingOpenFileRef.current;
+    if (!pending) {
+      setUnsavedDialogOpen(false);
+      return;
+    }
+
+    setUnsavedBusy(true);
+    setUnsavedError(null);
+    try {
+      const result = await runExport();
+      if (result.status === "cancelled") {
+        // Export dialog cancelled — remain on the current image.
+        return;
+      }
+      if (result.status === "error") {
+        setUnsavedError(result.message);
+        return;
+      }
+      pendingOpenFileRef.current = null;
+      setUnsavedDialogOpen(false);
+      await openImageFile(pending);
+    } finally {
+      setUnsavedBusy(false);
+    }
   }
 
   /** Commit a new present state and bind intensity/changes to that edit. */
@@ -436,9 +546,19 @@ function App() {
     setCustomLooks(loadSavedLooks());
   }
 
-  async function handleExport() {
-    // Use a ref so a second click before re-render cannot start another export.
-    if (!sourceFile || exportingRef.current || preparing || !source) return;
+  type ExportRunResult =
+    | { status: "saved" }
+    | { status: "cancelled" }
+    | { status: "error"; message: string };
+
+  /**
+   * Run the export flow. Success marks the document clean.
+   * Cancel / failure leave the document dirty.
+   */
+  async function runExport(): Promise<ExportRunResult> {
+    if (!sourceFile || exportingRef.current || preparing || !source) {
+      return { status: "cancelled" };
+    }
 
     const exportOptions = {
       sourceFile,
@@ -461,12 +581,12 @@ function App() {
           : "Could not open the save dialog.";
       setExportTone("error");
       setExportStatus(message);
-      return;
+      return { status: "error", message };
     }
 
     if (destination.status === "cancelled") {
       setExportStatus(null);
-      return;
+      return { status: "cancelled" };
     }
 
     exportingRef.current = true;
@@ -477,12 +597,14 @@ function App() {
 
       if (result.status === "cancelled") {
         setExportStatus(null);
-        return;
+        return { status: "cancelled" };
       }
 
       setExportTone("ok");
       const shortName = result.path.split(/[/\\]/).pop() ?? result.path;
       setExportStatus(`Saved ${shortName}`);
+      markClean(presentRef.current);
+      return { status: "saved" };
     } catch (error) {
       const message =
         error instanceof Error && error.message.trim()
@@ -490,12 +612,17 @@ function App() {
           : "Could not save the image.";
       setExportTone("error");
       setExportStatus(message);
+      return { status: "error", message };
     } finally {
       exportingRef.current = false;
       setExporting(false);
       // Ensure Ask pixle is remounted interactive after the export path.
       setEditorSessionKey((key) => key + 1);
     }
+  }
+
+  async function handleExport() {
+    await runExport();
   }
 
   useEffect(() => {
@@ -537,7 +664,7 @@ function App() {
 
   const imageReady = Boolean(source) && !preparing;
   const hasDocument = Boolean(sourceFile);
-  const controlsDisabled = !source || preparing || exporting;
+  const controlsDisabled = !source || preparing || exporting || unsavedBusy;
   const canSaveLook =
     imageReady && !parametersEqual(params, DEFAULT_EDIT_PARAMETERS);
 
@@ -556,7 +683,7 @@ function App() {
           <button
             type="button"
             className="toolbar__open"
-            disabled={exporting}
+            disabled={exporting || unsavedBusy}
             onClick={openImagePicker}
           >
             Open Image
@@ -564,12 +691,21 @@ function App() {
           {fileName ? (
             <span className="toolbar__filename" title={fileName}>
               {fileName}
+              {isDirty ? " •" : ""}
             </span>
           ) : null}
           {preparing ? (
             <span className="toolbar__prepare-status">Preparing editor…</span>
           ) : null}
-          {exportStatus ? (
+          {prepareError && !preparing ? (
+            <span
+              className="toolbar__export-status toolbar__export-status--error"
+              title={prepareError}
+            >
+              {prepareError}
+            </span>
+          ) : null}
+          {exportStatus && !prepareError ? (
             <span
               className={
                 exportTone === "error"
@@ -584,7 +720,7 @@ function App() {
           <button
             type="button"
             className="toolbar__export"
-            disabled={!imageReady || exporting}
+            disabled={!imageReady || exporting || unsavedBusy}
             onClick={handleExport}
           >
             {exporting ? "Exporting…" : "Export"}
@@ -596,7 +732,7 @@ function App() {
         <div className="workspace__main">
           {imageReady ? (
             <ImageToolbar
-              disabled={!imageReady || exporting}
+              disabled={!imageReady || exporting || unsavedBusy}
               canUndo={canUndo(history)}
               canRedo={canRedo(history)}
               showingBefore={showingBefore}
@@ -617,6 +753,8 @@ function App() {
               params={displayParams}
               onOpenImage={openImagePicker}
               comparing={showingBefore}
+              onCanvasReady={handleCanvasReady}
+              onPlaceholderRetired={handlePlaceholderRetired}
             />
           </div>
           <AiEditorPanel
@@ -642,6 +780,17 @@ function App() {
           onApplyLook={handleApplyLook}
         />
       </div>
+
+      <UnsavedChangesModal
+        open={unsavedDialogOpen}
+        busy={unsavedBusy}
+        error={unsavedError}
+        onSave={() => {
+          void handleUnsavedSave();
+        }}
+        onDontSave={handleUnsavedDontSave}
+        onCancel={handleUnsavedCancel}
+      />
     </div>
   );
 }

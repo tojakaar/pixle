@@ -211,7 +211,7 @@ Examples of intent → parameters:
 - "vibrance" vs "saturation": vibrance for lively but natural colour; saturation for even global chroma push/pull
 
 Optional:
-- edit_summary: a short plain-language note (one sentence, ≤120 characters). Explanatory only — never applied to pixels.
+- edit_summary: a short glance phrase for the UI (about 3–7 words, roughly ≤45 characters). Not a full sentence. Never start with "Applied". No trailing ellipsis. Examples: "Warm Kodak Gold", "Muted greens", "Soft summer film", "Fine monochrome grain", "Warm skin, cool shadows". Explanatory only — never applied to pixels. Detailed rationale belongs nowhere in the JSON.
 
 Do not return any other keys (no image data, histograms, analysis fields, presets, or reasoning fields).
 
@@ -659,6 +659,75 @@ fn parse_hsl(value: &Value) -> Result<HslAdjustments, String> {
     })
 }
 
+/// Soft UI budget matching the Ask-pixle status line.
+const EDIT_SUMMARY_MAX_CHARS: usize = 45;
+const EDIT_SUMMARY_MAX_WORDS: usize = 7;
+
+/// Turn a model `edit_summary` into a short glance phrase.
+/// About 3–7 words / ≤45 chars, never starts with "Applied", no ellipsis cut.
+fn shorten_edit_summary(raw: &str) -> Option<String> {
+    let mut text = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return None;
+    }
+
+    if let Some(rest) = text
+        .strip_prefix("Applied ")
+        .or_else(|| text.strip_prefix("applied "))
+        .or_else(|| text.strip_prefix("APPLIED "))
+    {
+        text = rest.trim().to_string();
+    }
+    if text.is_empty() {
+        return None;
+    }
+
+    // Phrase style: drop terminal sentence punctuation / ellipsis.
+    while text.ends_with('.') || text.ends_with('…') {
+        text.pop();
+        text = text.trim_end().to_string();
+    }
+    text = text.replace('…', " ").replace("...", " ");
+    text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        return None;
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return None;
+    }
+
+    let mut kept: Vec<&str> = Vec::new();
+    for word in &words {
+        if kept.len() >= EDIT_SUMMARY_MAX_WORDS {
+            break;
+        }
+        let candidate = if kept.is_empty() {
+            (*word).to_string()
+        } else {
+            format!("{} {}", kept.join(" "), word)
+        };
+        if candidate.chars().count() > EDIT_SUMMARY_MAX_CHARS {
+            break;
+        }
+        kept.push(word);
+    }
+
+    if kept.is_empty() {
+        // Prefer whole first word over mid-word slicing.
+        let first = words[0].trim_end_matches([',', ':', ';']).to_string();
+        return if first.is_empty() { None } else { Some(first) };
+    }
+    let joined = kept.join(" ");
+    let cleaned = joined.trim_end_matches([',', ':', ';']).trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
 fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
     let obj = value
         .as_object()
@@ -689,16 +758,7 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
     let edit_summary = match obj.get("edit_summary") {
         None => None,
         Some(Value::Null) => None,
-        Some(Value::String(s)) => {
-            let trimmed = s.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                // Keep summaries short for the UI status line.
-                let truncated: String = trimmed.chars().take(160).collect();
-                Some(truncated)
-            }
-        }
+        Some(Value::String(s)) => shorten_edit_summary(s),
         Some(_) => {
             return Err("Field `edit_summary` must be a string when present.".to_string());
         }
@@ -871,14 +931,30 @@ mod tests {
         obj.insert("exposure".into(), json!(0.2));
         obj.insert(
             "edit_summary".into(),
-            json!("  Warm cinematic grade; protected highlights.  "),
+            json!("  Warm Kodak Gold  "),
         );
         let parsed = parse_edit_response(&value).unwrap();
         assert_eq!(parsed.parameters.exposure, 0.2);
-        assert_eq!(
-            parsed.edit_summary.as_deref(),
-            Some("Warm cinematic grade; protected highlights.")
+        assert_eq!(parsed.edit_summary.as_deref(), Some("Warm Kodak Gold"));
+    }
+
+    #[test]
+    fn shortens_long_edit_summary_on_word_boundaries() {
+        let mut value = sample_full_params();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert(
+            "edit_summary".into(),
+            json!(
+                "Applied Kodak Gold aesthetic with warm golden tones, rich yellows and soft contrast throughout"
+            ),
         );
+        let parsed = parse_edit_response(&value).unwrap();
+        let summary = parsed.edit_summary.expect("summary");
+        assert!(!summary.to_lowercase().starts_with("applied"));
+        assert!(!summary.contains('…'));
+        assert!(summary.chars().count() <= 45);
+        assert!(summary.split_whitespace().count() <= 7);
+        assert_eq!(summary, "Kodak Gold aesthetic with warm golden tones");
     }
 
     #[test]

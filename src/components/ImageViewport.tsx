@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   applyEdits,
   isIdentityEdit,
@@ -24,15 +24,23 @@ interface ImageViewportProps {
   onOpenImage: () => void;
   /** True while the user is peeking at the untouched original. */
   comparing?: boolean;
+  /** Fired once the editable canvas has painted for the current open. */
+  onCanvasReady?: (openRequestId: number) => void;
+  /**
+   * Fired after the placeholder has faded out and is no longer displayed.
+   * Parent should only revoke the object URL after this.
+   */
+  onPlaceholderRetired?: (openRequestId: number) => void;
 }
+
+const PLACEHOLDER_FADE_MS = 180;
 
 /**
  * Centres the photo and draws a non-destructive preview.
  *
- * Shows an immediate `<img>` placeholder from the File object URL, then
- * swaps to the editable canvas once the working buffer is ready.
- * Slider updates are coalesced to animation frames; stale jobs are dropped
- * when `openRequestId` or source changes.
+ * Shows an immediate `<img>` placeholder from the File object URL, keeps it
+ * visible over the canvas until the first paint, then fades it out so the
+ * handoff never flashes an empty/black viewport.
  */
 export function ImageViewport({
   source,
@@ -42,6 +50,8 @@ export function ImageViewport({
   params,
   onOpenImage,
   comparing = false,
+  onCanvasReady,
+  onPlaceholderRetired,
 }: ImageViewportProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sourceRef = useRef<ImageData | null>(source);
@@ -49,10 +59,45 @@ export function ImageViewport({
   const openIdRef = useRef(openRequestId);
   const renderGenRef = useRef(0);
   const rafRef = useRef<number | null>(null);
+  const fadeTimerRef = useRef<number | null>(null);
+  /** Guards first-paint handoff so slider re-paints do not re-fade. */
+  const handedOffOpenIdRef = useRef<number | null>(null);
+  const onCanvasReadyRef = useRef(onCanvasReady);
+  const onPlaceholderRetiredRef = useRef(onPlaceholderRetired);
+
+  const [placeholderLayer, setPlaceholderLayer] = useState<string | null>(
+    placeholderUrl,
+  );
+  const [placeholderFading, setPlaceholderFading] = useState(false);
+  /** Open id for which putImageData has completed (drives spinner UI). */
+  const [paintedOpenId, setPaintedOpenId] = useState<number | null>(null);
 
   sourceRef.current = source;
   paramsRef.current = params;
   openIdRef.current = openRequestId;
+  onCanvasReadyRef.current = onCanvasReady;
+  onPlaceholderRetiredRef.current = onPlaceholderRetired;
+
+  // New open / new placeholder URL → keep the img up until the canvas paints.
+  useEffect(() => {
+    handedOffOpenIdRef.current = null;
+    setPaintedOpenId(null);
+    setPlaceholderFading(false);
+    if (fadeTimerRef.current !== null) {
+      window.clearTimeout(fadeTimerRef.current);
+      fadeTimerRef.current = null;
+    }
+    setPlaceholderLayer(placeholderUrl);
+  }, [openRequestId, placeholderUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (fadeTimerRef.current !== null) {
+        window.clearTimeout(fadeTimerRef.current);
+        fadeTimerRef.current = null;
+      }
+    };
+  }, []);
 
   // Opening a new image must cancel any in-flight paint immediately.
   useEffect(() => {
@@ -65,9 +110,10 @@ export function ImageViewport({
   }, [openRequestId]);
 
   useEffect(() => {
-    // Never paint an editable canvas while a newer open is still preparing,
-    // or when there is no working buffer.
-    if (!source || preparing) {
+    // Paint as soon as a working buffer exists — even while the placeholder
+    // still covers the canvas. Blocking on `preparing` caused a black flash
+    // because the img unmounted before putImageData ran.
+    if (!source) {
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
@@ -130,8 +176,46 @@ export function ImageViewport({
           h: current.height,
         });
         end();
+
+        setPaintedOpenId(boundOpenId);
+
+        // First successful paint for this open → notify parent, fade placeholder.
+        if (handedOffOpenIdRef.current !== boundOpenId) {
+          handedOffOpenIdRef.current = boundOpenId;
+          openLog(boundOpenId, "canvas ready; begin placeholder fade");
+          onCanvasReadyRef.current?.(boundOpenId);
+          setPlaceholderFading(true);
+          if (fadeTimerRef.current !== null) {
+            window.clearTimeout(fadeTimerRef.current);
+          }
+          fadeTimerRef.current = window.setTimeout(() => {
+            fadeTimerRef.current = null;
+            if (openIdRef.current !== boundOpenId) return;
+            setPlaceholderLayer(null);
+            setPlaceholderFading(false);
+            openLog(boundOpenId, "placeholder retired after fade");
+            onPlaceholderRetiredRef.current?.(boundOpenId);
+          }, PLACEHOLDER_FADE_MS);
+        }
       } catch (error) {
         openLog(boundOpenId, "canvas paint failed", error);
+        // Still release the prepare gate so a paint failure cannot lock the UI.
+        if (handedOffOpenIdRef.current !== boundOpenId) {
+          handedOffOpenIdRef.current = boundOpenId;
+          setPaintedOpenId(boundOpenId);
+          onCanvasReadyRef.current?.(boundOpenId);
+          setPlaceholderFading(true);
+          if (fadeTimerRef.current !== null) {
+            window.clearTimeout(fadeTimerRef.current);
+          }
+          fadeTimerRef.current = window.setTimeout(() => {
+            fadeTimerRef.current = null;
+            if (openIdRef.current !== boundOpenId) return;
+            setPlaceholderLayer(null);
+            setPlaceholderFading(false);
+            onPlaceholderRetiredRef.current?.(boundOpenId);
+          }, PLACEHOLDER_FADE_MS);
+        }
       }
     });
 
@@ -142,9 +226,9 @@ export function ImageViewport({
       }
       renderGenRef.current += 1;
     };
-  }, [source, params, openRequestId, preparing]);
+  }, [source, params, openRequestId]);
 
-  if (!source && !placeholderUrl) {
+  if (!source && !placeholderUrl && !placeholderLayer) {
     return (
       <div className="viewport viewport--empty">
         <div className="viewport__empty-card">
@@ -161,38 +245,50 @@ export function ImageViewport({
     );
   }
 
-  // Prefer the live placeholder whenever prepare is running or no working
-  // buffer exists — never flash a blank/black canvas during transitions.
-  const showPlaceholder =
-    Boolean(placeholderUrl) && (preparing || !source);
+  const waitingForCanvas =
+    preparing || (Boolean(source) && paintedOpenId !== openRequestId);
+  const showPlaceholder = Boolean(placeholderLayer);
 
   return (
     <div
       className={
         comparing
           ? "viewport viewport--comparing"
-          : preparing
+          : waitingForCanvas
             ? "viewport viewport--preparing"
             : "viewport"
       }
     >
-      {showPlaceholder ? (
-        <img
-          key={placeholderUrl ?? "placeholder"}
-          className="viewport__placeholder"
-          src={placeholderUrl!}
-          alt="Selected photo"
-          draggable={false}
-        />
-      ) : source ? (
-        <canvas
-          ref={canvasRef}
-          className="viewport__canvas"
-          aria-label={comparing ? "Original photo" : "Edited photo preview"}
-        />
-      ) : null}
-      {preparing ? (
+      <div className="viewport__stage">
+        {/* Canvas mounts under the placeholder as soon as the buffer exists. */}
+        {source ? (
+          <canvas
+            ref={canvasRef}
+            className={
+              showPlaceholder && !placeholderFading
+                ? "viewport__canvas viewport__canvas--pending"
+                : "viewport__canvas"
+            }
+            aria-label={comparing ? "Original photo" : "Edited photo preview"}
+          />
+        ) : null}
+        {showPlaceholder ? (
+          <img
+            key={placeholderLayer ?? "placeholder"}
+            className={
+              placeholderFading
+                ? "viewport__placeholder viewport__placeholder--fade-out"
+                : "viewport__placeholder"
+            }
+            src={placeholderLayer!}
+            alt="Selected photo"
+            draggable={false}
+          />
+        ) : null}
+      </div>
+      {waitingForCanvas ? (
         <div className="viewport__preparing" aria-live="polite">
+          <span className="viewport__spinner" aria-hidden="true" />
           Preparing editor…
         </div>
       ) : null}

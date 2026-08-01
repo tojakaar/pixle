@@ -67,3 +67,8 @@ export type { ChangeGroup } from "./changeGroups";
 export { groupParameterChanges } from "./changeGroups";
 export type { Look } from "./looks";
 export { BUILTIN_LOOKS } from "./looks";
+export {
+  EDIT_SUMMARY_MAX_CHARS,
+  EDIT_SUMMARY_MAX_WORDS,
+  shortenEditSummary,
+} from "./editSummary";
