@@ -4,6 +4,7 @@ import {
   isIdentityEdit,
   type EditParameters,
 } from "../engine";
+import { openLog } from "../engine/openLog";
 import { perfTime } from "../engine/perf";
 
 interface ImageViewportProps {
@@ -14,6 +15,8 @@ interface ImageViewportProps {
   source: ImageData | null;
   /** Object-URL of the original File for an immediate placeholder preview. */
   placeholderUrl: string | null;
+  /** Monotonic open request id — invalidates all pending paints when bumped. */
+  openRequestId: number;
   /** True while decode/prepare is still running. */
   preparing?: boolean;
   params: EditParameters;
@@ -28,11 +31,13 @@ interface ImageViewportProps {
  *
  * Shows an immediate `<img>` placeholder from the File object URL, then
  * swaps to the editable canvas once the working buffer is ready.
- * Slider updates are coalesced to animation frames; stale jobs are dropped.
+ * Slider updates are coalesced to animation frames; stale jobs are dropped
+ * when `openRequestId` or source changes.
  */
 export function ImageViewport({
   source,
   placeholderUrl,
+  openRequestId,
   preparing = false,
   params,
   onOpenImage,
@@ -41,38 +46,71 @@ export function ImageViewport({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sourceRef = useRef<ImageData | null>(source);
   const paramsRef = useRef(params);
+  const openIdRef = useRef(openRequestId);
   const renderGenRef = useRef(0);
   const rafRef = useRef<number | null>(null);
-  const outputRef = useRef<ImageData | null>(null);
 
   sourceRef.current = source;
   paramsRef.current = params;
+  openIdRef.current = openRequestId;
+
+  // Opening a new image must cancel any in-flight paint immediately.
+  useEffect(() => {
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    }
+    renderGenRef.current += 1;
+    openLog(openRequestId, "viewport invalidate renders");
+  }, [openRequestId]);
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    const src = sourceRef.current;
-    if (!canvas || !src) return;
-
-    const schedule = () => {
+    // Never paint an editable canvas while a newer open is still preparing,
+    // or when there is no working buffer.
+    if (!source || preparing) {
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current);
-      }
-      const gen = ++renderGenRef.current;
-      rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null;
-        if (gen !== renderGenRef.current) return;
+      }
+      renderGenRef.current += 1;
+      return;
+    }
 
-        const current = sourceRef.current;
-        const currentParams = paramsRef.current;
-        if (!current) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
+    const boundOpenId = openRequestId;
+    const gen = ++renderGenRef.current;
+
+    if (rafRef.current !== null) {
+      cancelAnimationFrame(rafRef.current);
+    }
+
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = null;
+      if (gen !== renderGenRef.current) {
+        openLog(boundOpenId, "skip stale RAF (gen)");
+        return;
+      }
+      if (openIdRef.current !== boundOpenId) {
+        openLog(boundOpenId, "skip stale RAF (openId)");
+        return;
+      }
+
+      const current = sourceRef.current;
+      const currentParams = paramsRef.current;
+      if (!current) return;
+
+      try {
         const ctx = canvas.getContext("2d");
         if (!ctx) return;
 
-        if (canvas.width !== current.width || canvas.height !== current.height) {
+        if (
+          canvas.width !== current.width ||
+          canvas.height !== current.height
+        ) {
           canvas.width = current.width;
           canvas.height = current.height;
-          outputRef.current = null;
         }
 
         const end = perfTime("viewport applyEdits+putImageData");
@@ -80,25 +118,31 @@ export function ImageViewport({
           ? current
           : applyEdits(current, currentParams);
 
-        // Reuse output buffer reference only for bookkeeping; putImageData needs ImageData.
-        outputRef.current = frame;
-        if (gen !== renderGenRef.current) return;
-        ctx.putImageData(frame, 0, 0);
-        end();
-      });
-    };
+        if (gen !== renderGenRef.current || openIdRef.current !== boundOpenId) {
+          openLog(boundOpenId, "skip stale putImageData");
+          end();
+          return;
+        }
 
-    schedule();
+        ctx.putImageData(frame, 0, 0);
+        openLog(boundOpenId, "canvas swap", {
+          w: current.width,
+          h: current.height,
+        });
+        end();
+      } catch (error) {
+        openLog(boundOpenId, "canvas paint failed", error);
+      }
+    });
 
     return () => {
       if (rafRef.current !== null) {
         cancelAnimationFrame(rafRef.current);
         rafRef.current = null;
       }
-      // Invalidate in-flight frame so it cannot paint after unmount / new source.
       renderGenRef.current += 1;
     };
-  }, [source, params]);
+  }, [source, params, openRequestId, preparing]);
 
   if (!source && !placeholderUrl) {
     return (
@@ -117,7 +161,10 @@ export function ImageViewport({
     );
   }
 
-  const showPlaceholder = Boolean(placeholderUrl) && !source;
+  // Prefer the live placeholder whenever prepare is running or no working
+  // buffer exists — never flash a blank/black canvas during transitions.
+  const showPlaceholder =
+    Boolean(placeholderUrl) && (preparing || !source);
 
   return (
     <div
@@ -131,18 +178,19 @@ export function ImageViewport({
     >
       {showPlaceholder ? (
         <img
+          key={placeholderUrl ?? "placeholder"}
           className="viewport__placeholder"
           src={placeholderUrl!}
           alt="Selected photo"
           draggable={false}
         />
-      ) : (
+      ) : source ? (
         <canvas
           ref={canvasRef}
           className="viewport__canvas"
           aria-label={comparing ? "Original photo" : "Edited photo preview"}
         />
-      )}
+      ) : null}
       {preparing ? (
         <div className="viewport__preparing" aria-live="polite">
           Preparing editor…

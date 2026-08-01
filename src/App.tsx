@@ -31,7 +31,8 @@ import {
   type Look,
   type PreviewSizeHint,
 } from "./engine";
-import { perfLog, perfTime } from "./engine/perf";
+import { isAbortError, openLog } from "./engine/openLog";
+import { perfTime } from "./engine/perf";
 import { loadSavedLooks, saveLook } from "./looksStorage";
 import "./App.css";
 
@@ -45,10 +46,15 @@ interface LastEditSession {
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const viewportShellRef = useRef<HTMLDivElement>(null);
-  const openGenerationRef = useRef(0);
+  /** Monotonic open request id — newest open always wins. */
+  const openRequestIdRef = useRef(0);
+  const openAbortRef = useRef<AbortController | null>(null);
   const exportingRef = useRef(false);
   const holdingBeforeRef = useRef(false);
+  /** Object URL currently shown (or pending canvas swap). */
   const placeholderUrlRef = useRef<string | null>(null);
+  /** URLs waiting to be revoked after React commits a newer placeholder. */
+  const urlsPendingRevokeRef = useRef<string[]>([]);
   const presentRef = useRef<EditParameters>(
     cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
   );
@@ -56,6 +62,8 @@ function App() {
   const [source, setSource] = useState<ImageData | null>(null);
   /** Immediate object-URL preview of the selected File. */
   const [placeholderUrl, setPlaceholderUrl] = useState<string | null>(null);
+  /** Exposed to the viewport so paints invalidate on every new open. */
+  const [openRequestId, setOpenRequestId] = useState(0);
   /** Original file kept for full-resolution export (never mutated). */
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [imageAnalysis, setImageAnalysis] = useState<ImageAnalysis | null>(
@@ -89,19 +97,54 @@ function App() {
     ? diffParameters(lastEdit.before, lastEdit.after)
     : [];
 
-  function revokePlaceholderUrl() {
-    if (placeholderUrlRef.current) {
-      URL.revokeObjectURL(placeholderUrlRef.current);
-      placeholderUrlRef.current = null;
-    }
-    setPlaceholderUrl(null);
+  function isCurrentOpen(requestId: number): boolean {
+    return requestId === openRequestIdRef.current;
   }
+
+  function queueRevoke(url: string | null | undefined, requestId: number): void {
+    if (!url) return;
+    urlsPendingRevokeRef.current.push(url);
+    openLog(requestId, "queued placeholder revoke", url.slice(-18));
+  }
+
+  // Revoke superseded object URLs only after React commits the new placeholder.
+  // This effect runs post-commit, so the visible <img> already uses the new URL.
+  // Never revoke the live placeholderUrlRef value.
+  useEffect(() => {
+    const pending = urlsPendingRevokeRef.current.splice(0);
+    if (pending.length === 0) return;
+    const live = placeholderUrlRef.current;
+    for (const url of pending) {
+      if (url === live) {
+        urlsPendingRevokeRef.current.push(url);
+        openLog(openRequestIdRef.current, "defer revoke; still current", url.slice(-18));
+        continue;
+      }
+      try {
+        URL.revokeObjectURL(url);
+        openLog(openRequestIdRef.current, "revoked obsolete placeholder", url.slice(-18));
+      } catch (error) {
+        openLog(openRequestIdRef.current, "revoke failed", error);
+      }
+    }
+  }, [placeholderUrl, openRequestId]);
 
   useEffect(() => {
     return () => {
-      if (placeholderUrlRef.current) {
-        URL.revokeObjectURL(placeholderUrlRef.current);
-        placeholderUrlRef.current = null;
+      openAbortRef.current?.abort();
+      openAbortRef.current = null;
+      const urls = [
+        ...urlsPendingRevokeRef.current,
+        placeholderUrlRef.current,
+      ].filter((u): u is string => Boolean(u));
+      urlsPendingRevokeRef.current = [];
+      placeholderUrlRef.current = null;
+      for (const url of new Set(urls)) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
       }
     };
   }, []);
@@ -131,13 +174,26 @@ function App() {
       return;
     }
 
-    const generation = ++openGenerationRef.current;
-    const endOpen = perfTime("open image pipeline");
+    // —— Invalidate the previous open immediately ——
+    const previousAbort = openAbortRef.current;
+    previousAbort?.abort();
+    const abortController = new AbortController();
+    openAbortRef.current = abortController;
 
-    // —— Immediate placeholder (no decode wait) ——
-    revokePlaceholderUrl();
+    const requestId = ++openRequestIdRef.current;
+    setOpenRequestId(requestId);
+    const endOpen = perfTime(`open image pipeline #${requestId}`);
+    openLog(requestId, "open start", { name: file.name, size: file.size });
+
+    // Create the new placeholder BEFORE clearing the old canvas source.
+    // Never revoke the previous URL synchronously while an <img> may still use it.
+    const previousUrl = placeholderUrlRef.current;
     const objectUrl = URL.createObjectURL(file);
     placeholderUrlRef.current = objectUrl;
+    if (previousUrl && previousUrl !== objectUrl) {
+      queueRevoke(previousUrl, requestId);
+    }
+
     setPlaceholderUrl(objectUrl);
     setSource(null);
     setSourceFile(file);
@@ -151,71 +207,114 @@ function App() {
     holdingBeforeRef.current = false;
     setEditorSessionKey((key) => key + 1);
     setPreparing(true);
+    openLog(requestId, "placeholder ready; preparing=true");
 
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
 
-    // Let the placeholder paint before heavy decode work.
+    // Let the newest placeholder paint before heavy decode work.
     await yieldToUi();
-    if (generation !== openGenerationRef.current) return;
+    if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
+      openLog(requestId, "stale after yield; ignore");
+      return;
+    }
 
     try {
       const hint = measurePreviewHint();
-      perfLog("preview hint", hint);
-      const decoded = await decodeImageFile(file, hint);
-      if (generation !== openGenerationRef.current) return;
+      openLog(requestId, "decode requested", hint);
+      const decoded = await decodeImageFile(file, {
+        hint,
+        signal: abortController.signal,
+        requestId,
+      });
+
+      if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
+        openLog(requestId, "stale after decode; discard ImageData");
+        return;
+      }
 
       const quickAnalysis = analyzeImageSync(decoded.working, {
         width: decoded.originalWidth,
         height: decoded.originalHeight,
       });
 
+      if (!isCurrentOpen(requestId)) {
+        openLog(requestId, "stale before setSource; ignore");
+        return;
+      }
+
       setSource(decoded.working);
       setImageAnalysis(quickAnalysis);
       setPreparing(false);
+      openLog(requestId, "editable preview ready; preparing=false", {
+        w: decoded.working.width,
+        h: decoded.working.height,
+      });
       endOpen();
 
-      // Drop the object URL once the editable canvas owns the view.
-      requestAnimationFrame(() => {
-        if (generation !== openGenerationRef.current) return;
+      // Drop the placeholder only after the canvas owns the view, and only if
+      // this request is still current. Revoke via the deferred queue.
+      window.requestAnimationFrame(() => {
+        if (!isCurrentOpen(requestId)) {
+          openLog(requestId, "stale before placeholder clear; ignore");
+          return;
+        }
         if (placeholderUrlRef.current === objectUrl) {
-          URL.revokeObjectURL(objectUrl);
           placeholderUrlRef.current = null;
           setPlaceholderUrl(null);
+          queueRevoke(objectUrl, requestId);
+          openLog(requestId, "placeholder cleared after canvas swap");
         }
       });
 
       await yieldToUi();
-      if (generation !== openGenerationRef.current) return;
+      if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
+        openLog(requestId, "stale before analysis; ignore");
+        return;
+      }
 
       try {
         const analysis = await analyzeImage(decoded.working, {
           width: decoded.originalWidth,
           height: decoded.originalHeight,
         });
-        if (generation !== openGenerationRef.current) return;
+        if (!isCurrentOpen(requestId)) {
+          openLog(requestId, "stale after analysis; ignore");
+          return;
+        }
         setImageAnalysis(analysis);
       } catch {
         // Keep quickAnalysis already applied.
       }
     } catch (error) {
-      perfLog("open image failed", error);
-      if (generation === openGenerationRef.current) {
-        revokePlaceholderUrl();
-        setSource(null);
-        setSourceFile(null);
-        setFileName(null);
-        setImageAnalysis(null);
-        setPreparing(false);
-        window.alert("Could not open that image.");
+      if (isAbortError(error) || !isCurrentOpen(requestId)) {
+        openLog(requestId, "open cancelled/stale", error);
+        return;
       }
+      openLog(requestId, "open failed", error);
+      // Real failure for the active request — reset to a usable empty state.
+      if (placeholderUrlRef.current === objectUrl) {
+        placeholderUrlRef.current = null;
+        setPlaceholderUrl(null);
+        queueRevoke(objectUrl, requestId);
+      }
+      setSource(null);
+      setSourceFile(null);
+      setFileName(null);
+      setImageAnalysis(null);
+      setPreparing(false);
+      window.alert("Could not open that image.");
     } finally {
-      if (generation === openGenerationRef.current) {
+      // Only the active request may clear the active preparing flag.
+      if (isCurrentOpen(requestId)) {
         setPreparing(false);
+        openLog(requestId, "loading finally; preparing=false");
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
         }
+      } else {
+        openLog(requestId, "loading finally ignored (not current)");
       }
     }
   }
@@ -513,6 +612,7 @@ function App() {
             <ImageViewport
               source={source}
               placeholderUrl={placeholderUrl}
+              openRequestId={openRequestId}
               preparing={preparing && hasDocument}
               params={displayParams}
               onOpenImage={openImagePicker}

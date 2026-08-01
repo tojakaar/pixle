@@ -27,7 +27,11 @@ export type {
   ImageAnalysis,
 } from "./imageAnalysis";
 export { analyzeImage, analyzeImageSync } from "./imageAnalysis";
-export type { DecodedImage, PreviewSizeHint } from "./imageDecode";
+export type {
+  DecodedImage,
+  DecodeImageOptions,
+  PreviewSizeHint,
+} from "./imageDecode";
 export {
   MAX_WORKING_EDGE,
   MIN_WORKING_EDGE,
@@ -35,6 +39,7 @@ export {
   decodeImageFile,
   yieldToUi,
 } from "./imageDecode";
+export { isAbortError, openLog, openLogEnabled } from "./openLog";
 export type { ExportFormat } from "./exportImage";
 export {
   defaultExportFileName,

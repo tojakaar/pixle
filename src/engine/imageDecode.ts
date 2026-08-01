@@ -1,3 +1,4 @@
+import { isAbortError, openLog } from "./openLog";
 import { perfLog, perfTime } from "./perf";
 
 /** Absolute cap on the working-buffer long edge (export is unaffected). */
@@ -23,6 +24,14 @@ export interface PreviewSizeHint {
   viewportHeight: number;
   /** window.devicePixelRatio (clamped internally). */
   devicePixelRatio?: number;
+}
+
+export interface DecodeImageOptions {
+  hint?: PreviewSizeHint | null;
+  /** Abort when a newer open request supersedes this decode. */
+  signal?: AbortSignal;
+  /** Stable open request id for race logs. */
+  requestId?: number;
 }
 
 interface Size {
@@ -53,6 +62,29 @@ export function computeWorkingMaxEdge(
   return edge;
 }
 
+function throwIfAborted(signal: AbortSignal | undefined, requestId: number): void {
+  if (signal?.aborted) {
+    openLog(requestId, "decode aborted");
+    throw new DOMException("Image open aborted", "AbortError");
+  }
+}
+
+/**
+ * Serialize createImageBitmap / heavy decode work so overlapping opens do not
+ * pile up decoder pressure in WKWebView. Newer requests still abort older ones
+ * via AbortSignal; this only prevents concurrent bitmap construction.
+ */
+let decodeTail: Promise<unknown> = Promise.resolve();
+
+function enqueueDecode<T>(task: () => Promise<T>): Promise<T> {
+  const run = decodeTail.then(task, task);
+  decodeTail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 /**
  * Decode a JPEG/PNG into a working ImageData capped by an adaptive long edge.
  *
@@ -61,54 +93,113 @@ export function computeWorkingMaxEdge(
  */
 export async function decodeImageFile(
   file: File,
-  hint?: PreviewSizeHint | null,
+  hintOrOptions?: PreviewSizeHint | null | DecodeImageOptions,
 ): Promise<DecodedImage> {
-  return withTimeout(
-    decodeImageFileInner(file, hint),
-    12_000,
-    "Timed out opening image.",
-  );
+  const options: DecodeImageOptions =
+    hintOrOptions &&
+    typeof hintOrOptions === "object" &&
+    ("hint" in hintOrOptions ||
+      "signal" in hintOrOptions ||
+      "requestId" in hintOrOptions)
+      ? (hintOrOptions as DecodeImageOptions)
+      : { hint: hintOrOptions as PreviewSizeHint | null | undefined };
+
+  const requestId = options.requestId ?? 0;
+  const signal = options.signal;
+
+  return enqueueDecode(async () => {
+    throwIfAborted(signal, requestId);
+    return withTimeout(
+      decodeImageFileInner(file, options.hint, signal, requestId),
+      12_000,
+      "Timed out opening image.",
+      signal,
+      requestId,
+    );
+  });
 }
 
 async function decodeImageFileInner(
   file: File,
-  hint?: PreviewSizeHint | null,
+  hint: PreviewSizeHint | null | undefined,
+  signal: AbortSignal | undefined,
+  requestId: number,
 ): Promise<DecodedImage> {
   const endAll = perfTime("decodeImageFile total");
+  openLog(requestId, "decode start", { name: file.name, size: file.size });
+
+  throwIfAborted(signal, requestId);
   const endProbe = perfTime("probeImageSize");
   const probed = await probeImageSize(file);
   endProbe();
+  throwIfAborted(signal, requestId);
 
   const sourceLong = probed
     ? Math.max(probed.width, probed.height)
     : undefined;
   const maxEdge = computeWorkingMaxEdge(hint, sourceLong);
-  perfLog("workingMaxEdge", { maxEdge, probed, hint });
+  openLog(requestId, "workingMaxEdge", { maxEdge, probed, hint });
 
   if (probed) {
     const target = fitWithin(probed, maxEdge);
     try {
       const endBmp = perfTime("createImageBitmap+getImageData");
-      const decoded = await decodeWithBitmapResize(file, probed, target, maxEdge);
+      const decoded = await decodeWithBitmapResize(
+        file,
+        probed,
+        target,
+        maxEdge,
+        signal,
+        requestId,
+      );
       endBmp();
       endAll();
+      openLog(requestId, "decode end (bitmap)", {
+        w: decoded.working.width,
+        h: decoded.working.height,
+      });
       return decoded;
     } catch (error) {
+      if (isAbortError(error)) throw error;
+      openLog(requestId, "createImageBitmap failed; falling back", error);
       perfLog("createImageBitmap failed; falling back", error);
-      // Fall through to element path.
     }
+
+    throwIfAborted(signal, requestId);
     const endHtml = perfTime("htmlImage+getImageData");
-    const decoded = await decodeWithHtmlImage(file, probed, target, maxEdge);
+    const decoded = await decodeWithHtmlImage(
+      file,
+      probed,
+      target,
+      maxEdge,
+      signal,
+      requestId,
+    );
     endHtml();
     endAll();
+    openLog(requestId, "decode end (html fallback)", {
+      w: decoded.working.width,
+      h: decoded.working.height,
+    });
     return decoded;
   }
 
-  // Unknown container — last-resort path (still capped on draw).
+  throwIfAborted(signal, requestId);
   const endHtml = perfTime("htmlImage fallback");
-  const decoded = await decodeWithHtmlImage(file, undefined, undefined, maxEdge);
+  const decoded = await decodeWithHtmlImage(
+    file,
+    undefined,
+    undefined,
+    maxEdge,
+    signal,
+    requestId,
+  );
   endHtml();
   endAll();
+  openLog(requestId, "decode end (html unknown)", {
+    w: decoded.working.width,
+    h: decoded.working.height,
+  });
   return decoded;
 }
 
@@ -116,16 +207,35 @@ function withTimeout<T>(
   promise: Promise<T>,
   ms: number,
   message: string,
+  signal: AbortSignal | undefined,
+  requestId: number,
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = window.setTimeout(() => reject(new Error(message)), ms);
+    if (signal?.aborted) {
+      reject(new DOMException("Image open aborted", "AbortError"));
+      return;
+    }
+
+    const timer = window.setTimeout(() => {
+      openLog(requestId, "decode timeout");
+      reject(new Error(message));
+    }, ms);
+
+    const onAbort = () => {
+      window.clearTimeout(timer);
+      reject(new DOMException("Image open aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     promise.then(
       (value) => {
         window.clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         resolve(value);
       },
       (error: unknown) => {
         window.clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
         reject(error);
       },
     );
@@ -133,8 +243,17 @@ function withTimeout<T>(
 }
 
 function supportsBitmapOrientation(): boolean {
-  // Feature-detect the options bag; older WebKit may ignore unknown keys.
   return typeof createImageBitmap === "function";
+}
+
+function closeBitmapSafe(bitmap: ImageBitmap | null | undefined, requestId: number): void {
+  if (!bitmap) return;
+  try {
+    bitmap.close();
+    openLog(requestId, "ImageBitmap.close()");
+  } catch (error) {
+    openLog(requestId, "ImageBitmap.close() failed", error);
+  }
 }
 
 async function decodeWithBitmapResize(
@@ -142,13 +261,16 @@ async function decodeWithBitmapResize(
   original: Size,
   target: Size,
   workingMaxEdge: number,
+  signal: AbortSignal | undefined,
+  requestId: number,
 ): Promise<DecodedImage> {
   if (!supportsBitmapOrientation()) {
     throw new Error("createImageBitmap unavailable");
   }
 
-  // Prefer oriented + resized decode. If the options object is rejected,
-  // retry with resize only, then without options.
+  throwIfAborted(signal, requestId);
+  openLog(requestId, "createImageBitmap start", target);
+
   let bitmap: ImageBitmap;
   try {
     bitmap = await createImageBitmap(file, {
@@ -158,6 +280,7 @@ async function decodeWithBitmapResize(
       imageOrientation: "from-image",
     } as ImageBitmapOptions);
   } catch {
+    throwIfAborted(signal, requestId);
     try {
       bitmap = await createImageBitmap(file, {
         resizeWidth: target.width,
@@ -165,12 +288,23 @@ async function decodeWithBitmapResize(
         resizeQuality: "high",
       });
     } catch {
+      throwIfAborted(signal, requestId);
       bitmap = await createImageBitmap(file);
     }
   }
 
+  openLog(requestId, "createImageBitmap resolved", {
+    w: bitmap.width,
+    h: bitmap.height,
+  });
+
+  // Newer open won — release this bitmap and stop before getImageData.
+  if (signal?.aborted) {
+    closeBitmapSafe(bitmap, requestId);
+    throw new DOMException("Image open aborted", "AbortError");
+  }
+
   try {
-    // If options were ignored and we got full-res, draw into the target size.
     const needsScale =
       bitmap.width > target.width + 1 || bitmap.height > target.height + 1;
     const drawW = needsScale ? target.width : bitmap.width;
@@ -184,6 +318,7 @@ async function decodeWithBitmapResize(
       throw new Error("Could not create canvas context");
     }
     ctx.drawImage(bitmap, 0, 0, drawW, drawH);
+    throwIfAborted(signal, requestId);
     const endGet = perfTime("getImageData");
     const working = ctx.getImageData(0, 0, drawW, drawH);
     endGet();
@@ -194,19 +329,24 @@ async function decodeWithBitmapResize(
       workingMaxEdge,
     };
   } finally {
-    bitmap.close();
+    closeBitmapSafe(bitmap, requestId);
   }
 }
 
 async function decodeWithHtmlImage(
   file: File,
-  knownOriginal?: Size,
-  knownTarget?: Size,
-  workingMaxEdge: number = MAX_WORKING_EDGE,
+  knownOriginal: Size | undefined,
+  knownTarget: Size | undefined,
+  workingMaxEdge: number,
+  signal: AbortSignal | undefined,
+  requestId: number,
 ): Promise<DecodedImage> {
+  throwIfAborted(signal, requestId);
   const url = URL.createObjectURL(file);
+  openLog(requestId, "html decode object URL created");
   try {
-    const image = await loadHtmlImage(url);
+    const image = await loadHtmlImage(url, signal);
+    throwIfAborted(signal, requestId);
     const original = knownOriginal ?? {
       width: image.naturalWidth,
       height: image.naturalHeight,
@@ -216,7 +356,13 @@ async function decodeWithHtmlImage(
     }
     const target =
       knownTarget ??
-      fitWithin(original, computeWorkingMaxEdge(null, Math.max(original.width, original.height)));
+      fitWithin(
+        original,
+        computeWorkingMaxEdge(
+          null,
+          Math.max(original.width, original.height),
+        ),
+      );
     const canvas = document.createElement("canvas");
     canvas.width = target.width;
     canvas.height = target.height;
@@ -225,6 +371,7 @@ async function decodeWithHtmlImage(
       throw new Error("Could not create canvas context");
     }
     ctx.drawImage(image, 0, 0, target.width, target.height);
+    throwIfAborted(signal, requestId);
     return {
       working: ctx.getImageData(0, 0, target.width, target.height),
       originalWidth: original.width,
@@ -232,15 +379,40 @@ async function decodeWithHtmlImage(
       workingMaxEdge,
     };
   } finally {
-    URL.revokeObjectURL(url);
+    try {
+      URL.revokeObjectURL(url);
+      openLog(requestId, "html decode object URL revoked");
+    } catch {
+      // ignore
+    }
   }
 }
 
-function loadHtmlImage(url: string): Promise<HTMLImageElement> {
+function loadHtmlImage(
+  url: string,
+  signal?: AbortSignal,
+): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Image open aborted", "AbortError"));
+      return;
+    }
     const image = new Image();
-    image.onload = () => resolve(image);
-    image.onerror = () => reject(new Error("Failed to decode image."));
+    const onAbort = () => {
+      image.onload = null;
+      image.onerror = null;
+      image.src = "";
+      reject(new DOMException("Image open aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    image.onload = () => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(image);
+    };
+    image.onerror = () => {
+      signal?.removeEventListener("abort", onAbort);
+      reject(new Error("Failed to decode image."));
+    };
     image.src = url;
   });
 }
@@ -290,9 +462,7 @@ export async function probeImageSize(file: File): Promise<Size | null> {
         continue;
       }
       const marker = bytes[offset + 1]!;
-      // Soften/start-of-scan/end — stop scanning
       if (marker === 0xd9 || marker === 0xda) break;
-      // SOF0 / SOF1 / SOF2 carry dimensions
       if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
         const height = (bytes[offset + 5]! << 8) | bytes[offset + 6]!;
         const width = (bytes[offset + 7]! << 8) | bytes[offset + 8]!;
