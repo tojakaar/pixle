@@ -9,6 +9,7 @@ import {
   isSemanticTargetLabel,
   shortenEditSummary,
   type EditParameters,
+  type EditSessionContext,
   type HslBand,
   type HslColorName,
   type ImageAnalysis,
@@ -20,8 +21,19 @@ import {
 const EDIT_SUMMARY_KEY = "edit_summary";
 /** Optional semantic region label; never a bitmap / pixel payload. */
 const TARGET_KEY = "target";
+const INTENT_KEY = "intent";
+const ADJUST_FACTOR_KEY = "adjust_factor";
+const CLARIFICATION_KEY = "clarification";
+const REFERENCE_TARGET_KEY = "reference_target";
 
 const HSL_CHANNELS: (keyof HslBand)[] = ["hue", "saturation", "luminance"];
+
+export type EditIntent =
+  | "edit"
+  | "adjust_previous"
+  | "undo_previous"
+  | "redo_previous"
+  | "clarify";
 
 export interface EditFromPromptResult {
   /** Values applied to the non-destructive edit pipeline. */
@@ -33,21 +45,27 @@ export interface EditFromPromptResult {
   target: SemanticTargetLabel | null;
   /** Short explanation from the model, if provided. */
   editSummary?: string;
+  /** Conversational intent relative to the EditSession. */
+  intent: EditIntent;
+  /** Scale for adjust_previous (e.g. 1.25 = a little more). */
+  adjustFactor?: number;
+  /** Concise clarification question when intent is clarify. */
+  clarification?: string;
+  /** Which prior target an adjust/undo refers to, when not the active one. */
+  referenceTarget?: string | null;
 }
 
 /**
  * Conversational photo-edit interface.
  *
- * Calls the Tauri/Rust backend, which talks to an OpenAI-compatible API using
- * server-side environment variables. The API key never enters the frontend.
- * Image understanding is provided as compact local `ImageAnalysis` metadata —
- * never full-resolution pixels. Gemini never segments or returns masks.
- * Only `parameters` (+ optional `target` label) are applied to the image.
+ * Optional `sessionContext` carries the active EditAction + recent summaries
+ * so follow-ups ("a little more") resolve without resending image history.
  */
 export async function editFromPrompt(
   prompt: string,
   currentParameters: EditParameters,
   imageAnalysis: ImageAnalysis,
+  sessionContext?: EditSessionContext | null,
 ): Promise<EditFromPromptResult> {
   const trimmed = prompt.trim();
   if (!trimmed) {
@@ -60,6 +78,7 @@ export async function editFromPrompt(
       prompt: trimmed,
       currentParameters,
       imageAnalysis,
+      sessionContext: sessionContext ?? null,
     });
   } catch (error) {
     throw new Error(formatInvokeError(error));
@@ -106,7 +125,6 @@ function parseTarget(value: unknown): SemanticTargetLabel | null {
     return null;
   }
   if (!isSemanticTargetLabel(normalized)) {
-    // Unknown labels are treated as global rather than rejecting the whole edit.
     console.warn(
       `[pixle ai] unsupported target "${value}"; applying as global edit. Known: ${SEMANTIC_TARGET_LABELS.join(", ")}`,
     );
@@ -115,10 +133,28 @@ function parseTarget(value: unknown): SemanticTargetLabel | null {
   return normalized;
 }
 
+function parseIntent(value: unknown): EditIntent {
+  if (value === null || value === undefined) return "edit";
+  if (typeof value !== "string") {
+    throw new Error("Field `intent` must be a string when present.");
+  }
+  const normalized = value.trim().toLowerCase();
+  const allowed: EditIntent[] = [
+    "edit",
+    "adjust_previous",
+    "undo_previous",
+    "redo_previous",
+    "clarify",
+  ];
+  if ((allowed as string[]).includes(normalized)) {
+    return normalized as EditIntent;
+  }
+  return "edit";
+}
+
 /**
  * Validate LLM/backend JSON before applying it to the UI.
- * Accepts the EditParameters schema plus optional `edit_summary` and `target`.
- * Rejects other unexpected fields (including image payloads / masks).
+ * Accepts EditParameters plus optional conversational fields.
  */
 export function parseEditResponse(value: unknown): EditFromPromptResult {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -137,12 +173,20 @@ export function parseEditResponse(value: unknown): EditFromPromptResult {
     throw new Error("Missing required field `hsl`.");
   }
 
+  const optionalKeys = new Set([
+    EDIT_SUMMARY_KEY,
+    TARGET_KEY,
+    INTENT_KEY,
+    ADJUST_FACTOR_KEY,
+    CLARIFICATION_KEY,
+    REFERENCE_TARGET_KEY,
+  ]);
+
   for (const key of keys) {
     const allowed =
       SCALAR_EDIT_KEYS.includes(key as ScalarEditParameterKey) ||
       key === "hsl" ||
-      key === EDIT_SUMMARY_KEY ||
-      key === TARGET_KEY;
+      optionalKeys.has(key);
     if (!allowed) {
       throw new Error(`Unexpected field \`${key}\` in EditParameters.`);
     }
@@ -193,8 +237,45 @@ export function parseEditResponse(value: unknown): EditFromPromptResult {
 
   const target =
     TARGET_KEY in record ? parseTarget(record[TARGET_KEY]) : null;
+  const intent =
+    INTENT_KEY in record ? parseIntent(record[INTENT_KEY]) : "edit";
 
-  return { parameters, target, editSummary };
+  let adjustFactor: number | undefined;
+  if (ADJUST_FACTOR_KEY in record && record[ADJUST_FACTOR_KEY] != null) {
+    const raw = record[ADJUST_FACTOR_KEY];
+    if (typeof raw !== "number" || !Number.isFinite(raw)) {
+      throw new Error("Field `adjust_factor` must be a finite number.");
+    }
+    adjustFactor = Math.min(3, Math.max(0.05, raw));
+  }
+
+  let clarification: string | undefined;
+  if (CLARIFICATION_KEY in record && record[CLARIFICATION_KEY] != null) {
+    const raw = record[CLARIFICATION_KEY];
+    if (typeof raw !== "string") {
+      throw new Error("Field `clarification` must be a string when present.");
+    }
+    clarification = raw.trim().slice(0, 160) || undefined;
+  }
+
+  let referenceTarget: string | null | undefined;
+  if (REFERENCE_TARGET_KEY in record) {
+    referenceTarget = parseTarget(record[REFERENCE_TARGET_KEY]);
+  }
+
+  if (intent === "clarify" && !clarification) {
+    clarification = "Which edit did you mean?";
+  }
+
+  return {
+    parameters,
+    target,
+    editSummary,
+    intent,
+    adjustFactor,
+    clarification,
+    referenceTarget,
+  };
 }
 
 export function parseEditParameters(value: unknown): EditParameters {
@@ -204,7 +285,6 @@ export function parseEditParameters(value: unknown): EditParameters {
 const GEMINI_BUSY_MESSAGE =
   "Gemini is temporarily busy. Please try again in a moment.";
 
-/** Map provider overload / 503 payloads to a short UI-safe message. */
 function isProviderUnavailable(message: string): boolean {
   const upper = message.toUpperCase();
   return (

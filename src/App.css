@@ -294,6 +294,10 @@ input {
   color: #a33b2d;
 }
 
+.ai-panel__status--clarify {
+  color: #8a6a2f;
+}
+
 .ai-panel__form {
   display: flex;
   align-items: center;
@@ -815,6 +819,50 @@ input {
   letter-spacing: 0.07em;
   text-transform: uppercase;
   color: color-mix(in srgb, var(--text-muted) 85%, var(--border));
+}
+
+.changes-tab__actions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.changes-tab__action {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  width: 100%;
+  margin: 0;
+  padding: 0.55rem 0.6rem;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.changes-tab__action:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.changes-tab__action--active {
+  border-color: color-mix(in srgb, var(--accent) 40%, var(--border));
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.changes-tab__action-summary {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.changes-tab__action-empty {
+  font-size: 0.78rem;
+  color: var(--text-muted);
 }
 
 .changes-tab__list {

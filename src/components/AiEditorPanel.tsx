@@ -1,80 +1,55 @@
 import { useRef, useState, type FormEvent } from "react";
-import {
-  editFromPrompt,
-  type EditFromPromptResult,
-} from "../aiEditor";
-import { shortenEditSummary, type EditParameters, type ImageAnalysis } from "../engine";
+
+export interface AiPromptResult {
+  message: string;
+  tone: "ok" | "error" | "clarify";
+}
 
 interface AiEditorPanelProps {
-  params: EditParameters;
-  imageAnalysis: ImageAnalysis | null;
   disabled: boolean;
-  onApply: (result: EditFromPromptResult) => void | Promise<void>;
+  /** True while image analysis is still preparing. */
+  analysisReady: boolean;
+  onSubmitPrompt: (prompt: string) => Promise<AiPromptResult>;
 }
 
 /**
- * Conversational edit controls. Talks to `editFromPrompt` only — LLM access
- * stays in the Tauri backend so the API key never reaches the webview.
- * Gemini may name a semantic `target`; segmentation stays local.
+ * Conversational edit controls. Delegates prompt resolution to App so
+ * EditSession follow-ups, clarifications, and Gemini share one path.
  */
 export function AiEditorPanel({
-  params,
-  imageAnalysis,
   disabled,
-  onApply,
+  analysisReady,
+  onSubmitPrompt,
 }: AiEditorPanelProps) {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
-  const [statusTone, setStatusTone] = useState<"ok" | "error">("ok");
+  const [statusTone, setStatusTone] = useState<"ok" | "error" | "clarify">(
+    "ok",
+  );
   const requestIdRef = useRef(0);
-  const paramsRef = useRef(params);
-  const analysisRef = useRef(imageAnalysis);
 
-  paramsRef.current = params;
-  analysisRef.current = imageAnalysis;
-
-  const chatReady = Boolean(imageAnalysis) && !disabled;
+  const chatReady = analysisReady && !disabled;
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     const trimmed = prompt.trim();
-    const analysis = analysisRef.current;
-    if (!trimmed || !chatReady || busy || !analysis) return;
+    if (!trimmed || !chatReady || busy) return;
 
     const requestId = ++requestIdRef.current;
     setBusy(true);
     setStatus(null);
 
     try {
-      const result = await editFromPrompt(
-        trimmed,
-        paramsRef.current,
-        analysis,
-      );
+      const result = await onSubmitPrompt(trimmed);
       if (requestId !== requestIdRef.current) return;
-
-      try {
-        await onApply(result);
+      setStatusTone(result.tone);
+      setStatus(result.message);
+      if (result.tone === "ok") {
         setPrompt("");
-        setStatusTone("ok");
-        const summary =
-          shortenEditSummary(result.editSummary) || "Edit applied";
-        setStatus(
-          result.target ? `${summary} · ${result.target}` : summary,
-        );
-      } catch (applyError) {
-        // Applying must never leave the panel stuck in Sending…
-        const message =
-          applyError instanceof Error && applyError.message.trim()
-            ? applyError.message
-            : "Could not apply that edit";
-        setStatusTone("error");
-        setStatus(message);
       }
     } catch (error) {
       if (requestId !== requestIdRef.current) return;
-
       const message =
         error instanceof Error && error.message.trim()
           ? error.message
@@ -97,7 +72,9 @@ export function AiEditorPanel({
             className={
               statusTone === "error"
                 ? "ai-panel__status ai-panel__status--error"
-                : "ai-panel__status"
+                : statusTone === "clarify"
+                  ? "ai-panel__status ai-panel__status--clarify"
+                  : "ai-panel__status"
             }
             title={status}
           >
@@ -115,9 +92,9 @@ export function AiEditorPanel({
           placeholder={
             disabled
               ? "Open an image to edit with AI"
-              : !imageAnalysis
+              : !analysisReady
                 ? "Preparing image analysis…"
-                : 'Try “darken the sky”, “cinematic”, or “warm sunset”'
+                : 'Try “darken the sky”, then “a little more”'
           }
           onChange={(e) => setPrompt(e.currentTarget.value)}
           aria-label="Edit instruction"

@@ -1,6 +1,9 @@
 import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
-import type { EditFromPromptResult } from "./aiEditor";
-import { AiEditorPanel } from "./components/AiEditorPanel";
+import { editFromPrompt, type EditFromPromptResult } from "./aiEditor";
+import {
+  AiEditorPanel,
+  type AiPromptResult,
+} from "./components/AiEditorPanel";
 import { ImageToolbar } from "./components/ImageToolbar";
 import { ImageViewport } from "./components/ImageViewport";
 import { RightSidebar } from "./components/RightSidebar";
@@ -12,34 +15,50 @@ import {
 import {
   BUILTIN_LOOKS,
   DEFAULT_EDIT_PARAMETERS,
+  actionIntensitySession,
   analyzeImage,
   analyzeImageSync,
+  appendEditAction,
+  buildSessionContext,
   canRedo,
   canUndo,
+  clampScalarParam,
   cloneEditDocument,
   cloneEditParameters,
   commitEdit,
+  conversationalRedo,
+  conversationalUndo,
   createDefaultSegmenter,
+  createEditAction,
   createEditHistory,
+  createEditSession,
   createGlobalEditDocument,
   createLocalEditDocument,
   createMaskProvider,
   decodeImageFile,
-  diffParameters,
   documentGlobalParameters,
   editDocumentsEqual,
+  getActiveAction,
+  groupActionsForHistory,
   isMaskDebugEnabled,
   lerpParameters,
+  looksLikeFollowUp,
   parametersEqual,
   redoEdit,
   resetEdit,
+  resolveSemanticLabel,
+  scaleActionParameters,
+  selectEditAction,
+  shortenEditSummary,
   toggleMaskDebugEnabled,
+  tryResolveFollowUp,
   undoEdit,
   yieldToUi,
   type ApplyEditsOptions,
   type EditDocument,
   type EditHistoryState,
   type EditParameters,
+  type EditSession,
   type ImageAnalysis,
   type Look,
   type Mask,
@@ -51,7 +70,7 @@ import { perfLog, perfTime } from "./engine/perf";
 import { loadSavedLooks, saveLook } from "./looksStorage";
 import "./App.css";
 
-/** Tracks the most recent AI or look apply for intensity + changes. */
+/** Intensity binding for the active EditAction. */
 interface LastEditSession {
   before: EditParameters;
   after: EditParameters;
@@ -103,6 +122,12 @@ function App() {
   const [showingBefore, setShowingBefore] = useState(false);
   const [, setBeforeLatched] = useState(false);
   const [lastEdit, setLastEdit] = useState<LastEditSession | null>(null);
+  /** Conversational edit session for the current image only. */
+  const [editSession, setEditSession] = useState<EditSession>(() =>
+    createEditSession(0),
+  );
+  const editSessionRef = useRef(editSession);
+  editSessionRef.current = editSession;
   const [customLooks, setCustomLooks] = useState<Look[]>(() =>
     loadSavedLooks(),
   );
@@ -154,9 +179,10 @@ function App() {
     editDoc.baseParameters,
   ]);
 
-  const changes = lastEdit
-    ? diffParameters(lastEdit.before, lastEdit.after)
-    : [];
+  const actionGroups = useMemo(
+    () => groupActionsForHistory(editSession.actions),
+    [editSession.actions],
+  );
 
   function isCurrentOpen(requestId: number): boolean {
     return requestId === openRequestIdRef.current;
@@ -345,6 +371,7 @@ function App() {
     setImageAnalysis(null);
     setHistory(createEditHistory());
     setLastEdit(null);
+    setEditSession(createEditSession(requestId));
     setActiveMask(null);
     setMaskStatus("none");
     setCachedMasks(null);
@@ -580,8 +607,44 @@ function App() {
     }
   }
 
-  /** Commit a global (whole-image) edit and bind intensity/changes. */
-  function applyCommittedEdit(next: EditParameters) {
+  function bindIntensityFromAction(action: {
+    beforeParameters: EditParameters;
+    parameters: EditParameters;
+  }): void {
+    setLastEdit(actionIntensitySession({
+      id: "",
+      target: null,
+      targetLabel: "",
+      parameters: action.parameters,
+      baseParameters: null,
+      beforeParameters: action.beforeParameters,
+      maskLabel: null,
+      mask: null,
+      timestamp: 0,
+      summary: "",
+      prompt: "",
+    }));
+  }
+
+  function recordSessionAction(input: {
+    target: string | null;
+    parameters: EditParameters;
+    baseParameters: EditParameters | null;
+    beforeParameters: EditParameters;
+    mask: Mask | null;
+    summary: string;
+    prompt: string;
+  }): void {
+    const action = createEditAction(input);
+    setEditSession((prev) => appendEditAction(prev, action));
+    bindIntensityFromAction(action);
+  }
+
+  /** Commit a global (whole-image) edit and bind intensity + session action. */
+  function applyCommittedEdit(
+    next: EditParameters,
+    meta?: { summary?: string; prompt?: string },
+  ) {
     const beforeDoc = presentRef.current;
     const beforeParams = beforeDoc.parameters;
     if (
@@ -591,66 +654,77 @@ function App() {
       return;
     }
 
-    setLastEdit({
-      before: cloneEditParameters(beforeParams),
-      after: cloneEditParameters(next),
-      intensity: 100,
-    });
     setHistory((prev) =>
       commitEdit(prev, createGlobalEditDocument(next)),
     );
+    recordSessionAction({
+      target: null,
+      parameters: next,
+      baseParameters: null,
+      beforeParameters: beforeParams,
+      mask: null,
+      summary: meta?.summary || "Global edit",
+      prompt: meta?.prompt || "",
+    });
   }
 
   /**
-   * Apply an AI result. When Gemini names a supported target and the Segmenter
-   * finds a mask, parameters apply only under that mask. Otherwise behave as
-   * today's global edit — never block on missing segmentation.
+   * Apply parameters for a semantic target using the cached Segmenter mask.
+   * Falls back to global when no mask is available.
    */
-  async function applyAiEdit(result: EditFromPromptResult): Promise<void> {
+  async function applyTargetedEdit(input: {
+    target: string;
+    parameters: EditParameters;
+    summary: string;
+    prompt: string;
+  }): Promise<"local" | "global"> {
     const beforeDoc = presentRef.current;
-    const nextParams = result.parameters;
-    const target = result.target;
+    const resolved = resolveSemanticLabel(input.target);
+    const nextParams = input.parameters;
 
-    if (target && source) {
+    if (source) {
       try {
-        // Prefer session cache (prefetch); wait on Segmenter only on cache miss.
-        let mask = maskProviderRef.current.getCachedLabel(target);
+        let mask = maskProviderRef.current.getCachedLabel(resolved);
         if (!mask) {
-          mask = await maskProviderRef.current.findLabel(source, target);
+          mask = await maskProviderRef.current.findLabel(source, resolved);
           setCachedMasks(maskProviderRef.current.getCachedCollection());
         }
         if (mask) {
           const baseParameters =
-            beforeDoc.maskTarget === target && beforeDoc.baseParameters
+            beforeDoc.maskTarget === resolved && beforeDoc.baseParameters
               ? beforeDoc.baseParameters
               : documentGlobalParameters(beforeDoc);
           const intensityBefore =
-            beforeDoc.maskTarget === target
+            beforeDoc.maskTarget === resolved
               ? beforeDoc.parameters
               : baseParameters;
 
           if (
-            beforeDoc.maskTarget === target &&
+            beforeDoc.maskTarget === resolved &&
             parametersEqual(beforeDoc.parameters, nextParams) &&
             beforeDoc.baseParameters &&
             parametersEqual(beforeDoc.baseParameters, baseParameters)
           ) {
-            return;
+            return "local";
           }
 
           setActiveMask(mask);
-          setLastEdit({
-            before: cloneEditParameters(intensityBefore),
-            after: cloneEditParameters(nextParams),
-            intensity: 100,
-          });
           setHistory((prev) =>
             commitEdit(
               prev,
-              createLocalEditDocument(nextParams, target, baseParameters),
+              createLocalEditDocument(nextParams, resolved, baseParameters),
             ),
           );
-          return;
+          recordSessionAction({
+            target: resolved,
+            parameters: nextParams,
+            baseParameters,
+            beforeParameters: intensityBefore,
+            mask,
+            summary: input.summary,
+            prompt: input.prompt,
+          });
+          return "local";
         }
       } catch (error) {
         console.warn(
@@ -660,7 +734,254 @@ function App() {
       }
     }
 
-    applyCommittedEdit(nextParams);
+    applyCommittedEdit(nextParams, {
+      summary: input.summary,
+      prompt: input.prompt,
+    });
+    return "global";
+  }
+
+  async function applyAiEditResult(
+    result: EditFromPromptResult,
+    prompt: string,
+  ): Promise<AiPromptResult> {
+    const intent = result.intent || "edit";
+
+    if (intent === "clarify") {
+      return {
+        message: result.clarification || "Which edit did you mean?",
+        tone: "clarify",
+      };
+    }
+
+    if (intent === "undo_previous") {
+      return applyConversationalUndo();
+    }
+    if (intent === "redo_previous") {
+      return applyConversationalRedo();
+    }
+
+    if (intent === "adjust_previous") {
+      const session = editSessionRef.current;
+      let action = getActiveAction(session);
+      if (result.referenceTarget) {
+        const resolved = resolveSemanticLabel(result.referenceTarget);
+        action =
+          [...session.actions]
+            .reverse()
+            .find((a) => a.target === resolved) ?? action;
+      }
+      if (!action) {
+        return {
+          message: "Which edit should I adjust?",
+          tone: "clarify",
+        };
+      }
+
+      const factor = result.adjustFactor;
+      // When Gemini supplies a relative factor, scale only that action's delta.
+      // Otherwise apply the absolute grade it returned for the same target.
+      const nextParams =
+        factor != null
+          ? scaleActionParameters(
+              action.beforeParameters,
+              action.parameters,
+              factor,
+            )
+          : result.parameters;
+      const summary =
+        shortenEditSummary(result.editSummary) ||
+        (factor != null
+          ? factor >= 1
+            ? `Stronger ${action.targetLabel}`
+            : `Softer ${action.targetLabel}`
+          : `Adjusted ${action.targetLabel}`);
+
+      if (action.target) {
+        await applyTargetedEdit({
+          target: action.target,
+          parameters: nextParams,
+          summary,
+          prompt,
+        });
+      } else {
+        applyCommittedEdit(nextParams, { summary, prompt });
+      }
+      return { message: summary, tone: "ok" };
+    }
+
+    // Default: new edit
+    const summary =
+      shortenEditSummary(result.editSummary) ||
+      (result.target ? `${result.target} edit` : "Edit applied");
+    if (result.target) {
+      const mode = await applyTargetedEdit({
+        target: result.target,
+        parameters: result.parameters,
+        summary,
+        prompt,
+      });
+      return {
+        message: mode === "local" ? `${summary} · ${result.target}` : summary,
+        tone: "ok",
+      };
+    }
+    applyCommittedEdit(result.parameters, { summary, prompt });
+    return { message: summary, tone: "ok" };
+  }
+
+  function applyConversationalUndo(): AiPromptResult {
+    const { session, undone } = conversationalUndo(editSessionRef.current);
+    if (!undone) {
+      return { message: "Nothing to undo", tone: "error" };
+    }
+    setEditSession(session);
+    // Restore document to the pre-action grade (document undo stack also advances).
+    setHistory((prev) =>
+      commitEdit(
+        prev,
+        undone.target && undone.baseParameters
+          ? createLocalEditDocument(
+              undone.beforeParameters,
+              undone.target,
+              undone.baseParameters,
+            )
+          : createGlobalEditDocument(undone.beforeParameters),
+      ),
+    );
+    if (undone.mask && undone.target) {
+      setActiveMask(undone.mask);
+    } else if (!undone.target) {
+      setActiveMask(null);
+    }
+    const active = getActiveAction(session);
+    if (active) {
+      bindIntensityFromAction(active);
+    } else {
+      setLastEdit(null);
+    }
+    return { message: `Undid ${undone.summary}`, tone: "ok" };
+  }
+
+  function applyConversationalRedo(): AiPromptResult {
+    const { session, redone } = conversationalRedo(editSessionRef.current);
+    if (!redone) {
+      return { message: "Nothing to redo", tone: "error" };
+    }
+    setEditSession(session);
+    setHistory((prev) =>
+      commitEdit(
+        prev,
+        redone.target && redone.baseParameters
+          ? createLocalEditDocument(
+              redone.parameters,
+              redone.target,
+              redone.baseParameters,
+            )
+          : createGlobalEditDocument(redone.parameters),
+      ),
+    );
+    if (redone.mask) setActiveMask(redone.mask);
+    bindIntensityFromAction(redone);
+    return { message: `Redid ${redone.summary}`, tone: "ok" };
+  }
+
+  /**
+   * Full conversational prompt path: local follow-ups first, then Gemini with
+   * EditSession context. Never blocks editing on ambiguity — asks instead.
+   */
+  async function handleAiPrompt(prompt: string): Promise<AiPromptResult> {
+    const trimmed = prompt.trim();
+    if (!trimmed) {
+      return { message: "Prompt must not be empty.", tone: "error" };
+    }
+    if (!imageAnalysis) {
+      return { message: "Image analysis is still preparing…", tone: "error" };
+    }
+
+    const session = editSessionRef.current;
+
+    // 1) Deterministic follow-ups against the active EditAction.
+    const local = tryResolveFollowUp(trimmed, session);
+    if (local) {
+      if (local.kind === "undo") return applyConversationalUndo();
+      if (local.kind === "redo") return applyConversationalRedo();
+
+      const action = local.action;
+      if (local.kind === "amplify" || local.kind === "reduce") {
+        const factor = local.factor ?? 1;
+        const next = scaleActionParameters(
+          action.beforeParameters,
+          action.parameters,
+          factor,
+        );
+        const summary =
+          factor >= 1
+            ? `A little more · ${action.targetLabel}`
+            : `Not that much · ${action.targetLabel}`;
+        if (action.target) {
+          await applyTargetedEdit({
+            target: action.target,
+            parameters: next,
+            summary,
+            prompt: trimmed,
+          });
+        } else {
+          applyCommittedEdit(next, { summary, prompt: trimmed });
+        }
+        return { message: summary, tone: "ok" };
+      }
+
+      if (local.kind === "warmer" || local.kind === "cooler") {
+        const next = cloneEditParameters(action.parameters);
+        next.temperature = clampScalarParam(
+          "temperature",
+          next.temperature + (local.temperatureDelta ?? 0),
+        );
+        const summary =
+          local.kind === "warmer"
+            ? `Warmer · ${action.targetLabel}`
+            : `Cooler · ${action.targetLabel}`;
+        if (action.target) {
+          await applyTargetedEdit({
+            target: action.target,
+            parameters: next,
+            summary,
+            prompt: trimmed,
+          });
+        } else {
+          applyCommittedEdit(next, { summary, prompt: trimmed });
+        }
+        return { message: summary, tone: "ok" };
+      }
+    }
+
+    // 2) Follow-up wording with no actionable session → ask, never guess.
+    if (looksLikeFollowUp(trimmed) && session.actions.length === 0) {
+      return {
+        message: "Which edit should I adjust? Try a first edit first.",
+        tone: "clarify",
+      };
+    }
+
+    // 3) Gemini with compact EditSession context.
+    const result = await editFromPrompt(
+      trimmed,
+      presentRef.current.parameters,
+      imageAnalysis,
+      buildSessionContext(session),
+    );
+    return applyAiEditResult(result, trimmed);
+  }
+
+  function handleSelectAction(actionId: string) {
+    const chosen = editSessionRef.current.actions.find(
+      (action) => action.id === actionId,
+    );
+    if (!chosen) return;
+    setEditSession((prev) => selectEditAction(prev, actionId));
+    bindIntensityFromAction(chosen);
+    if (chosen.mask) setActiveMask(chosen.mask);
   }
 
   /**
@@ -712,6 +1033,9 @@ function App() {
   function handleReset() {
     setHistory((prev) => resetEdit(prev));
     setLastEdit(null);
+    setEditSession(createEditSession(openRequestIdRef.current));
+    setActiveMask(null);
+    setMaskStatus("none");
     setShowingBefore(false);
     setBeforeLatched(false);
     holdingBeforeRef.current = false;
@@ -998,10 +1322,9 @@ function App() {
           </div>
           <AiEditorPanel
             key={editorSessionKey}
-            params={params}
-            imageAnalysis={imageAnalysis}
+            analysisReady={Boolean(imageAnalysis)}
             disabled={controlsDisabled}
-            onApply={applyAiEdit}
+            onSubmitPrompt={handleAiPrompt}
           />
         </div>
         <RightSidebar
@@ -1011,7 +1334,9 @@ function App() {
           onReset={handleReset}
           intensity={lastEdit ? lastEdit.intensity : null}
           onIntensityChange={handleIntensityChange}
-          changes={changes}
+          actionGroups={actionGroups}
+          activeActionId={editSession.activeActionId}
+          onSelectAction={handleSelectAction}
           builtinLooks={BUILTIN_LOOKS}
           customLooks={customLooks}
           canSaveLook={canSaveLook}
