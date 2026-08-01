@@ -1,6 +1,6 @@
-import type { Look } from "../engine/looks";
+import type { Look } from "../../engine/looks";
 
-interface LooksPanelProps {
+interface LooksTabProps {
   builtinLooks: Look[];
   customLooks: Look[];
   disabled: boolean;
@@ -9,21 +9,21 @@ interface LooksPanelProps {
   onSave: () => void;
 }
 
-export function LooksPanel({
+export function LooksTab({
   builtinLooks,
   customLooks,
   disabled,
   canSave,
   onApply,
   onSave,
-}: LooksPanelProps) {
+}: LooksTabProps) {
   return (
-    <section className="looks-panel" aria-label="Looks">
-      <header className="looks-panel__header">
-        <h3 className="looks-panel__title">Looks</h3>
+    <div className="sidebar-tab" aria-label="Looks">
+      <header className="sidebar-tab__header">
+        <h2 className="sidebar-tab__title">Looks</h2>
         <button
           type="button"
-          className="looks-panel__save"
+          className="sidebar-tab__action"
           disabled={!canSave || disabled}
           onClick={onSave}
         >
@@ -70,6 +70,6 @@ export function LooksPanel({
       ) : (
         <p className="looks-panel__empty">No saved looks yet</p>
       )}
-    </section>
+    </div>
   );
 }

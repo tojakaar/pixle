@@ -1,4 +1,7 @@
-import type { EditParameters } from "./engine";
+import {
+  normalizeEditParameters,
+  type EditParameters,
+} from "./engine";
 import type { Look } from "./engine/looks";
 
 const STORAGE_KEY = "pixle.savedLooks.v1";
@@ -10,35 +13,33 @@ interface StoredLook {
   createdAt: number;
 }
 
-function isEditParameters(value: unknown): value is EditParameters {
-  if (!value || typeof value !== "object") return false;
-  const p = value as Record<string, unknown>;
-  return (
-    typeof p.exposure === "number" &&
-    typeof p.contrast === "number" &&
-    typeof p.highlights === "number" &&
-    typeof p.shadows === "number" &&
-    typeof p.temperature === "number" &&
-    typeof p.tint === "number" &&
-    typeof p.saturation === "number"
-  );
-}
-
 function parseStored(raw: string | null): StoredLook[] {
   if (!raw) return [];
   try {
     const data = JSON.parse(raw) as unknown;
     if (!Array.isArray(data)) return [];
-    return data.filter((item): item is StoredLook => {
-      if (!item || typeof item !== "object") return false;
+    const looks: StoredLook[] = [];
+    for (const item of data) {
+      if (!item || typeof item !== "object") continue;
       const look = item as Record<string, unknown>;
-      return (
-        typeof look.id === "string" &&
-        typeof look.name === "string" &&
-        typeof look.createdAt === "number" &&
-        isEditParameters(look.parameters)
-      );
-    });
+      if (
+        typeof look.id !== "string" ||
+        typeof look.name !== "string" ||
+        typeof look.createdAt !== "number"
+      ) {
+        continue;
+      }
+      // Missing newer fields receive neutral defaults (legacy Looks stay valid).
+      const parameters = normalizeEditParameters(look.parameters);
+      if (!parameters) continue;
+      looks.push({
+        id: look.id,
+        name: look.name,
+        parameters,
+        createdAt: look.createdAt,
+      });
+    }
+    return looks;
   } catch {
     return [];
   }
@@ -50,7 +51,7 @@ export function loadSavedLooks(): Look[] {
   return parseStored(localStorage.getItem(STORAGE_KEY)).map((look) => ({
     id: look.id,
     name: look.name,
-    parameters: { ...look.parameters },
+    parameters: normalizeEditParameters(look.parameters)!,
     builtin: false,
   }));
 }
@@ -70,10 +71,13 @@ export function saveLook(
   const trimmed = name.trim();
   if (!trimmed) return null;
 
+  const normalized = normalizeEditParameters(parameters);
+  if (!normalized) return null;
+
   const stored: StoredLook = {
     id: `custom:${crypto.randomUUID()}`,
     name: trimmed,
-    parameters: { ...parameters },
+    parameters: normalized,
     createdAt: Date.now(),
   };
 
@@ -83,7 +87,7 @@ export function saveLook(
   return {
     id: stored.id,
     name: stored.name,
-    parameters: { ...stored.parameters },
+    parameters: normalizeEditParameters(stored.parameters)!,
     builtin: false,
   };
 }

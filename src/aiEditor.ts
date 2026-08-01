@@ -1,23 +1,21 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
-  EDIT_SLIDER_CONFIG,
-  type EditParameterKey,
+  HSL_COLOR_NAMES,
+  SCALAR_EDIT_KEYS,
+  clampHslChannel,
+  clampScalarParam,
+  createDefaultHsl,
   type EditParameters,
+  type HslBand,
+  type HslColorName,
   type ImageAnalysis,
+  type ScalarEditParameterKey,
 } from "./engine";
-
-const EDIT_PARAMETER_KEYS: EditParameterKey[] = [
-  "exposure",
-  "contrast",
-  "highlights",
-  "shadows",
-  "temperature",
-  "tint",
-  "saturation",
-];
 
 /** Optional model note; never applied as an image parameter. */
 const EDIT_SUMMARY_KEY = "edit_summary";
+
+const HSL_CHANNELS: (keyof HslBand)[] = ["hue", "saturation", "luminance"];
 
 export interface EditFromPromptResult {
   /** Values applied to the non-destructive edit pipeline. */
@@ -59,6 +57,34 @@ export async function editFromPrompt(
   return parseEditResponse(raw);
 }
 
+function parseHslBand(value: unknown, color: HslColorName): HslBand {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`Field \`hsl.${color}\` must be an object.`);
+  }
+  const record = value as Record<string, unknown>;
+  for (const channel of HSL_CHANNELS) {
+    if (!(channel in record)) {
+      throw new Error(`Missing required field \`hsl.${color}.${channel}\`.`);
+    }
+  }
+  for (const key of Object.keys(record)) {
+    if (!HSL_CHANNELS.includes(key as keyof HslBand)) {
+      throw new Error(`Unexpected field \`hsl.${color}.${key}\`.`);
+    }
+  }
+  const band = {} as HslBand;
+  for (const channel of HSL_CHANNELS) {
+    const rawValue = record[channel];
+    if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) {
+      throw new Error(
+        `Field \`hsl.${color}.${channel}\` must be a finite number.`,
+      );
+    }
+    band[channel] = clampHslChannel(channel, rawValue);
+  }
+  return band;
+}
+
 /**
  * Validate LLM/backend JSON before applying it to the UI.
  * Accepts the EditParameters schema plus optional `edit_summary`.
@@ -72,28 +98,54 @@ export function parseEditResponse(value: unknown): EditFromPromptResult {
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record);
 
-  for (const key of EDIT_PARAMETER_KEYS) {
+  for (const key of SCALAR_EDIT_KEYS) {
     if (!(key in record)) {
       throw new Error(`Missing required field \`${key}\`.`);
     }
   }
+  if (!("hsl" in record)) {
+    throw new Error("Missing required field `hsl`.");
+  }
 
   for (const key of keys) {
     const allowed =
-      EDIT_PARAMETER_KEYS.includes(key as EditParameterKey) ||
+      SCALAR_EDIT_KEYS.includes(key as ScalarEditParameterKey) ||
+      key === "hsl" ||
       key === EDIT_SUMMARY_KEY;
     if (!allowed) {
       throw new Error(`Unexpected field \`${key}\` in EditParameters.`);
     }
   }
 
-  const parameters = {} as EditParameters;
-  for (const key of EDIT_PARAMETER_KEYS) {
+  const parameters = {
+    hsl: createDefaultHsl(),
+  } as EditParameters;
+
+  for (const key of SCALAR_EDIT_KEYS) {
     const rawValue = record[key];
     if (typeof rawValue !== "number" || !Number.isFinite(rawValue)) {
       throw new Error(`Field \`${key}\` must be a finite number.`);
     }
-    parameters[key] = clampParam(key, rawValue);
+    parameters[key] = clampScalarParam(key, rawValue);
+  }
+
+  const hslRaw = record.hsl;
+  if (hslRaw === null || typeof hslRaw !== "object" || Array.isArray(hslRaw)) {
+    throw new Error("Field `hsl` must be an object.");
+  }
+  const hslRecord = hslRaw as Record<string, unknown>;
+  for (const color of HSL_COLOR_NAMES) {
+    if (!(color in hslRecord)) {
+      throw new Error(`Missing required field \`hsl.${color}\`.`);
+    }
+  }
+  for (const key of Object.keys(hslRecord)) {
+    if (!HSL_COLOR_NAMES.includes(key as HslColorName)) {
+      throw new Error(`Unexpected field \`hsl.${key}\`.`);
+    }
+  }
+  for (const color of HSL_COLOR_NAMES) {
+    parameters.hsl[color] = parseHslBand(hslRecord[color], color);
   }
 
   let editSummary: string | undefined;
@@ -116,21 +168,32 @@ export function parseEditParameters(value: unknown): EditParameters {
   return parseEditResponse(value).parameters;
 }
 
-function clampParam(key: EditParameterKey, value: number): number {
-  const { min, max, step } = EDIT_SLIDER_CONFIG[key];
-  const clamped = Math.min(max, Math.max(min, value));
-  if (step >= 1) {
-    return Math.round(clamped);
-  }
-  const decimals = Math.max(0, Math.round(-Math.log10(step)));
-  return Number(clamped.toFixed(decimals));
+const GEMINI_BUSY_MESSAGE =
+  "Gemini is temporarily busy. Please try again in a moment.";
+
+/** Map provider overload / 503 payloads to a short UI-safe message. */
+function isProviderUnavailable(message: string): boolean {
+  const upper = message.toUpperCase();
+  return (
+    upper.includes("503") ||
+    upper.includes("UNAVAILABLE") ||
+    upper.includes("TEMPORARILY BUSY")
+  );
 }
 
 function formatInvokeError(error: unknown): string {
   if (typeof error === "string" && error.trim()) {
+    if (isProviderUnavailable(error)) {
+      console.warn("[pixle ai] provider unavailable:", error);
+      return GEMINI_BUSY_MESSAGE;
+    }
     return error;
   }
   if (error instanceof Error && error.message.trim()) {
+    if (isProviderUnavailable(error.message)) {
+      console.warn("[pixle ai] provider unavailable:", error.message);
+      return GEMINI_BUSY_MESSAGE;
+    }
     return error.message;
   }
   return "AI edit request failed.";

@@ -1,8 +1,8 @@
 import { useDeferredValue, useEffect, useRef, useState } from "react";
 import { AiEditorPanel } from "./components/AiEditorPanel";
-import { EditPanel } from "./components/EditPanel";
 import { ImageToolbar } from "./components/ImageToolbar";
 import { ImageViewport } from "./components/ImageViewport";
+import { RightSidebar } from "./components/RightSidebar";
 import {
   chooseExportDestination,
   writeExport,
@@ -14,6 +14,7 @@ import {
   analyzeImageSync,
   canRedo,
   canUndo,
+  cloneEditParameters,
   commitEdit,
   createEditHistory,
   decodeImageFile,
@@ -28,7 +29,10 @@ import {
   type EditParameters,
   type ImageAnalysis,
   type Look,
+  type PreviewSizeHint,
 } from "./engine";
+import { isAbortError, openLog } from "./engine/openLog";
+import { perfTime } from "./engine/perf";
 import { loadSavedLooks, saveLook } from "./looksStorage";
 import "./App.css";
 
@@ -41,18 +45,32 @@ interface LastEditSession {
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const openGenerationRef = useRef(0);
+  const viewportShellRef = useRef<HTMLDivElement>(null);
+  /** Monotonic open request id — newest open always wins. */
+  const openRequestIdRef = useRef(0);
+  const openAbortRef = useRef<AbortController | null>(null);
   const exportingRef = useRef(false);
   const holdingBeforeRef = useRef(false);
-  const presentRef = useRef<EditParameters>({ ...DEFAULT_EDIT_PARAMETERS });
+  /** Object URL currently shown (or pending canvas swap). */
+  const placeholderUrlRef = useRef<string | null>(null);
+  /** URLs waiting to be revoked after React commits a newer placeholder. */
+  const urlsPendingRevokeRef = useRef<string[]>([]);
+  const presentRef = useRef<EditParameters>(
+    cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
+  );
+  /** Working preview buffer — set once per open; not recopied on slider moves. */
   const [source, setSource] = useState<ImageData | null>(null);
+  /** Immediate object-URL preview of the selected File. */
+  const [placeholderUrl, setPlaceholderUrl] = useState<string | null>(null);
+  /** Exposed to the viewport so paints invalidate on every new open. */
+  const [openRequestId, setOpenRequestId] = useState(0);
   /** Original file kept for full-resolution export (never mutated). */
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [imageAnalysis, setImageAnalysis] = useState<ImageAnalysis | null>(
     null,
   );
   const [fileName, setFileName] = useState<string | null>(null);
-  const [opening, setOpening] = useState(false);
+  const [preparing, setPreparing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [exportTone, setExportTone] = useState<"ok" | "error">("ok");
@@ -79,9 +97,72 @@ function App() {
     ? diffParameters(lastEdit.before, lastEdit.after)
     : [];
 
+  function isCurrentOpen(requestId: number): boolean {
+    return requestId === openRequestIdRef.current;
+  }
+
+  function queueRevoke(url: string | null | undefined, requestId: number): void {
+    if (!url) return;
+    urlsPendingRevokeRef.current.push(url);
+    openLog(requestId, "queued placeholder revoke", url.slice(-18));
+  }
+
+  // Revoke superseded object URLs only after React commits the new placeholder.
+  // This effect runs post-commit, so the visible <img> already uses the new URL.
+  // Never revoke the live placeholderUrlRef value.
+  useEffect(() => {
+    const pending = urlsPendingRevokeRef.current.splice(0);
+    if (pending.length === 0) return;
+    const live = placeholderUrlRef.current;
+    for (const url of pending) {
+      if (url === live) {
+        urlsPendingRevokeRef.current.push(url);
+        openLog(openRequestIdRef.current, "defer revoke; still current", url.slice(-18));
+        continue;
+      }
+      try {
+        URL.revokeObjectURL(url);
+        openLog(openRequestIdRef.current, "revoked obsolete placeholder", url.slice(-18));
+      } catch (error) {
+        openLog(openRequestIdRef.current, "revoke failed", error);
+      }
+    }
+  }, [placeholderUrl, openRequestId]);
+
+  useEffect(() => {
+    return () => {
+      openAbortRef.current?.abort();
+      openAbortRef.current = null;
+      const urls = [
+        ...urlsPendingRevokeRef.current,
+        placeholderUrlRef.current,
+      ].filter((u): u is string => Boolean(u));
+      urlsPendingRevokeRef.current = [];
+      placeholderUrlRef.current = null;
+      for (const url of new Set(urls)) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
+      }
+    };
+  }, []);
+
+  function measurePreviewHint(): PreviewSizeHint {
+    const el = viewportShellRef.current;
+    const rect = el?.getBoundingClientRect();
+    return {
+      viewportWidth: Math.max(1, rect?.width ?? window.innerWidth * 0.65),
+      viewportHeight: Math.max(1, rect?.height ?? window.innerHeight * 0.6),
+      devicePixelRatio: window.devicePixelRatio || 1,
+    };
+  }
+
   async function handleFileChange(fileList: FileList | null) {
     const file = fileList?.[0];
-    if (!file || opening || exportingRef.current) return;
+    // Allow replacing an image while prepare is running; only block during export.
+    if (!file || exportingRef.current) return;
 
     const accepted =
       file.type === "image/jpeg" ||
@@ -93,67 +174,153 @@ function App() {
       return;
     }
 
-    const generation = ++openGenerationRef.current;
-    setOpening(true);
+    // —— Invalidate the previous open immediately ——
+    const previousAbort = openAbortRef.current;
+    previousAbort?.abort();
+    const abortController = new AbortController();
+    openAbortRef.current = abortController;
+
+    const requestId = ++openRequestIdRef.current;
+    setOpenRequestId(requestId);
+    const endOpen = perfTime(`open image pipeline #${requestId}`);
+    openLog(requestId, "open start", { name: file.name, size: file.size });
+
+    // Create the new placeholder BEFORE clearing the old canvas source.
+    // Never revoke the previous URL synchronously while an <img> may still use it.
+    const previousUrl = placeholderUrlRef.current;
+    const objectUrl = URL.createObjectURL(file);
+    placeholderUrlRef.current = objectUrl;
+    if (previousUrl && previousUrl !== objectUrl) {
+      queueRevoke(previousUrl, requestId);
+    }
+
+    setPlaceholderUrl(objectUrl);
+    setSource(null);
+    setSourceFile(file);
+    setFileName(file.name);
+    setImageAnalysis(null);
+    setHistory(createEditHistory());
+    setLastEdit(null);
     setExportStatus(null);
     setShowingBefore(false);
     setBeforeLatched(false);
     holdingBeforeRef.current = false;
-    setLastEdit(null);
     setEditorSessionKey((key) => key + 1);
+    setPreparing(true);
+    openLog(requestId, "placeholder ready; preparing=true");
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+
+    // Let the newest placeholder paint before heavy decode work.
+    await yieldToUi();
+    if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
+      openLog(requestId, "stale after yield; ignore");
+      return;
+    }
 
     try {
-      const decoded = await decodeImageFile(file);
-      if (generation !== openGenerationRef.current) return;
+      const hint = measurePreviewHint();
+      openLog(requestId, "decode requested", hint);
+      const decoded = await decodeImageFile(file, {
+        hint,
+        signal: abortController.signal,
+        requestId,
+      });
 
-      // Sync analysis is cheap on the working buffer — enable Ask pixle immediately.
+      if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
+        openLog(requestId, "stale after decode; discard ImageData");
+        return;
+      }
+
       const quickAnalysis = analyzeImageSync(decoded.working, {
         width: decoded.originalWidth,
         height: decoded.originalHeight,
       });
 
-      setSource(decoded.working);
-      setSourceFile(file);
-      setImageAnalysis(quickAnalysis);
-      setFileName(file.name);
-      setHistory(createEditHistory());
-      // Leave Opening as soon as pixels are shown; analysis continues below.
-      setOpening(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
+      if (!isCurrentOpen(requestId)) {
+        openLog(requestId, "stale before setSource; ignore");
+        return;
       }
 
-      await yieldToUi();
-      if (generation !== openGenerationRef.current) return;
+      setSource(decoded.working);
+      setImageAnalysis(quickAnalysis);
+      setPreparing(false);
+      openLog(requestId, "editable preview ready; preparing=false", {
+        w: decoded.working.width,
+        h: decoded.working.height,
+      });
+      endOpen();
 
-      // Optional face enrichment; never clears the quick analysis on failure.
+      // Drop the placeholder only after the canvas owns the view, and only if
+      // this request is still current. Revoke via the deferred queue.
+      window.requestAnimationFrame(() => {
+        if (!isCurrentOpen(requestId)) {
+          openLog(requestId, "stale before placeholder clear; ignore");
+          return;
+        }
+        if (placeholderUrlRef.current === objectUrl) {
+          placeholderUrlRef.current = null;
+          setPlaceholderUrl(null);
+          queueRevoke(objectUrl, requestId);
+          openLog(requestId, "placeholder cleared after canvas swap");
+        }
+      });
+
+      await yieldToUi();
+      if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
+        openLog(requestId, "stale before analysis; ignore");
+        return;
+      }
+
       try {
         const analysis = await analyzeImage(decoded.working, {
           width: decoded.originalWidth,
           height: decoded.originalHeight,
         });
-        if (generation !== openGenerationRef.current) return;
+        if (!isCurrentOpen(requestId)) {
+          openLog(requestId, "stale after analysis; ignore");
+          return;
+        }
         setImageAnalysis(analysis);
       } catch {
         // Keep quickAnalysis already applied.
       }
-    } catch {
-      if (generation === openGenerationRef.current) {
-        window.alert("Could not open that image.");
+    } catch (error) {
+      if (isAbortError(error) || !isCurrentOpen(requestId)) {
+        openLog(requestId, "open cancelled/stale", error);
+        return;
       }
+      openLog(requestId, "open failed", error);
+      // Real failure for the active request — reset to a usable empty state.
+      if (placeholderUrlRef.current === objectUrl) {
+        placeholderUrlRef.current = null;
+        setPlaceholderUrl(null);
+        queueRevoke(objectUrl, requestId);
+      }
+      setSource(null);
+      setSourceFile(null);
+      setFileName(null);
+      setImageAnalysis(null);
+      setPreparing(false);
+      window.alert("Could not open that image.");
     } finally {
-      // Safety net: never leave Opening stuck after a failed/cancelled open.
-      if (generation === openGenerationRef.current) {
-        setOpening(false);
+      // Only the active request may clear the active preparing flag.
+      if (isCurrentOpen(requestId)) {
+        setPreparing(false);
+        openLog(requestId, "loading finally; preparing=false");
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
         }
+      } else {
+        openLog(requestId, "loading finally ignored (not current)");
       }
     }
   }
 
   function openImagePicker() {
-    if (opening) return;
+    if (exportingRef.current) return;
     fileInputRef.current?.click();
   }
 
@@ -163,8 +330,8 @@ function App() {
     if (parametersEqual(before, next)) return;
 
     setLastEdit({
-      before: { ...before },
-      after: { ...next },
+      before: cloneEditParameters(before),
+      after: cloneEditParameters(next),
       intensity: 100,
     });
     setHistory((prev) => commitEdit(prev, next));
@@ -181,7 +348,7 @@ function App() {
   ) {
     setHistory((prev) => ({
       ...prev,
-      present: { ...next },
+      present: cloneEditParameters(next),
       // Live slider changes discard redo — present has diverged.
       future: [],
     }));
@@ -254,7 +421,7 @@ function App() {
   }
 
   function handleApplyLook(look: Look) {
-    applyCommittedEdit({ ...look.parameters });
+    applyCommittedEdit(cloneEditParameters(look.parameters));
   }
 
   function handleSaveLook() {
@@ -271,11 +438,11 @@ function App() {
 
   async function handleExport() {
     // Use a ref so a second click before re-render cannot start another export.
-    if (!sourceFile || exportingRef.current || opening) return;
+    if (!sourceFile || exportingRef.current || preparing || !source) return;
 
     const exportOptions = {
       sourceFile,
-      params: { ...presentRef.current },
+      params: cloneEditParameters(presentRef.current),
       originalFileName: fileName,
     };
 
@@ -368,8 +535,9 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [source]);
 
-  const imageReady = Boolean(source) && !opening;
-  const controlsDisabled = !source || opening || exporting;
+  const imageReady = Boolean(source) && !preparing;
+  const hasDocument = Boolean(sourceFile);
+  const controlsDisabled = !source || preparing || exporting;
   const canSaveLook =
     imageReady && !parametersEqual(params, DEFAULT_EDIT_PARAMETERS);
 
@@ -388,15 +556,18 @@ function App() {
           <button
             type="button"
             className="toolbar__open"
-            disabled={opening || exporting}
+            disabled={exporting}
             onClick={openImagePicker}
           >
-            {opening ? "Opening…" : "Open Image"}
+            Open Image
           </button>
           {fileName ? (
             <span className="toolbar__filename" title={fileName}>
               {fileName}
             </span>
+          ) : null}
+          {preparing ? (
+            <span className="toolbar__prepare-status">Preparing editor…</span>
           ) : null}
           {exportStatus ? (
             <span
@@ -437,12 +608,17 @@ function App() {
               onToggleBefore={handleToggleBefore}
             />
           ) : null}
-          <ImageViewport
-            source={source}
-            params={displayParams}
-            onOpenImage={openImagePicker}
-            comparing={showingBefore}
-          />
+          <div className="workspace__viewport" ref={viewportShellRef}>
+            <ImageViewport
+              source={source}
+              placeholderUrl={placeholderUrl}
+              openRequestId={openRequestId}
+              preparing={preparing && hasDocument}
+              params={displayParams}
+              onOpenImage={openImagePicker}
+              comparing={showingBefore}
+            />
+          </div>
           <AiEditorPanel
             key={editorSessionKey}
             params={params}
@@ -451,7 +627,7 @@ function App() {
             onApply={applyCommittedEdit}
           />
         </div>
-        <EditPanel
+        <RightSidebar
           params={params}
           disabled={controlsDisabled}
           onChange={setParamsLive}

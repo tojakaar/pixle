@@ -1,7 +1,24 @@
-export type { EditParameters, EditParameterKey } from "./EditParameters";
+export type {
+  EditParameters,
+  EditParameterKey,
+  ScalarEditParameterKey,
+  HslBand,
+  HslColorName,
+  HslAdjustments,
+} from "./EditParameters";
 export {
   DEFAULT_EDIT_PARAMETERS,
+  DEFAULT_HSL_BAND,
   EDIT_SLIDER_CONFIG,
+  HSL_BAND_SLIDER_CONFIG,
+  HSL_COLOR_NAMES,
+  SCALAR_EDIT_KEYS,
+  clampHslChannel,
+  clampScalarParam,
+  cloneEditParameters,
+  createDefaultHsl,
+  hslColorLabel,
+  normalizeEditParameters,
 } from "./EditParameters";
 export { applyEdits, isIdentityEdit } from "./render";
 export type {
@@ -10,12 +27,19 @@ export type {
   ImageAnalysis,
 } from "./imageAnalysis";
 export { analyzeImage, analyzeImageSync } from "./imageAnalysis";
-export type { DecodedImage } from "./imageDecode";
+export type {
+  DecodedImage,
+  DecodeImageOptions,
+  PreviewSizeHint,
+} from "./imageDecode";
 export {
   MAX_WORKING_EDGE,
+  MIN_WORKING_EDGE,
+  computeWorkingMaxEdge,
   decodeImageFile,
   yieldToUi,
 } from "./imageDecode";
+export { isAbortError, openLog, openLogEnabled } from "./openLog";
 export type { ExportFormat } from "./exportImage";
 export {
   defaultExportFileName,
@@ -39,5 +63,7 @@ export {
   diffParameters,
   lerpParameters,
 } from "./editDiff";
+export type { ChangeGroup } from "./changeGroups";
+export { groupParameterChanges } from "./changeGroups";
 export type { Look } from "./looks";
 export { BUILTIN_LOOKS } from "./looks";
