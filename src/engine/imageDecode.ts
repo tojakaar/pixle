@@ -70,26 +70,16 @@ function throwIfAborted(signal: AbortSignal | undefined, requestId: number): voi
 }
 
 /**
- * Serialize createImageBitmap / heavy decode work so overlapping opens do not
- * pile up decoder pressure in WKWebView. Newer requests still abort older ones
- * via AbortSignal; this only prevents concurrent bitmap construction.
- */
-let decodeTail: Promise<unknown> = Promise.resolve();
-
-function enqueueDecode<T>(task: () => Promise<T>): Promise<T> {
-  const run = decodeTail.then(task, task);
-  decodeTail = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return run;
-}
-
-/**
  * Decode a JPEG/PNG into a working ImageData capped by an adaptive long edge.
  *
  * Prefer decoding already-resized via `createImageBitmap` so we never
  * materialise a multi‑megapixel bitmap in WKWebView.
+ *
+ * Decodes are NOT globally serialized. The latest open always receives priority:
+ * older work is aborted via AbortSignal and discarded via requestId checks.
+ * Cancelled in-flight bitmaps may still finish native decode (not abortable)
+ * but their results are ignored and bitmaps are closed — they do not block
+ * the newest request from starting.
  */
 export async function decodeImageFile(
   file: File,
@@ -107,16 +97,16 @@ export async function decodeImageFile(
   const requestId = options.requestId ?? 0;
   const signal = options.signal;
 
-  return enqueueDecode(async () => {
-    throwIfAborted(signal, requestId);
-    return withTimeout(
-      decodeImageFileInner(file, options.hint, signal, requestId),
-      12_000,
-      "Timed out opening image.",
-      signal,
-      requestId,
-    );
-  });
+  throwIfAborted(signal, requestId);
+  const endQueue = perfTime(`decode start (no queue wait) #${requestId}`);
+  endQueue();
+  return withTimeout(
+    decodeImageFileInner(file, options.hint, signal, requestId),
+    12_000,
+    "Timed out opening image.",
+    signal,
+    requestId,
+  );
 }
 
 async function decodeImageFileInner(

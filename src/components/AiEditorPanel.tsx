@@ -1,6 +1,6 @@
 import { useRef, useState, type FormEvent } from "react";
 import { editFromPrompt } from "../aiEditor";
-import type { EditParameters, ImageAnalysis } from "../engine";
+import { shortenEditSummary, type EditParameters, type ImageAnalysis } from "../engine";
 
 interface AiEditorPanelProps {
   params: EditParameters;
@@ -54,7 +54,9 @@ export function AiEditorPanel({
         onApply(result.parameters);
         setPrompt("");
         setStatusTone("ok");
-        setStatus(result.editSummary?.trim() || "Applied to sliders");
+        setStatus(
+          shortenEditSummary(result.editSummary) || "Edit applied",
+        );
       } catch (applyError) {
         // Applying must never leave the panel stuck in Sending…
         const message =

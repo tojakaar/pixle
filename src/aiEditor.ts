@@ -5,6 +5,7 @@ import {
   clampHslChannel,
   clampScalarParam,
   createDefaultHsl,
+  shortenEditSummary,
   type EditParameters,
   type HslBand,
   type HslColorName,
@@ -156,8 +157,7 @@ export function parseEditResponse(value: unknown): EditFromPromptResult {
     } else if (typeof summary !== "string") {
       throw new Error("Field `edit_summary` must be a string when present.");
     } else {
-      const trimmed = summary.trim();
-      editSummary = trimmed ? trimmed.slice(0, 160) : undefined;
+      editSummary = shortenEditSummary(summary);
     }
   }
 
