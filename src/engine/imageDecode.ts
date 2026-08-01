@@ -1,5 +1,10 @@
-/** Max edge length for the in-memory working buffer (WebKit-safe + fast). */
+import { perfLog, perfTime } from "./perf";
+
+/** Absolute cap on the working-buffer long edge (export is unaffected). */
 export const MAX_WORKING_EDGE = 1600;
+
+/** Floor so tiny windows still get a usable edit buffer. */
+export const MIN_WORKING_EDGE = 960;
 
 export interface DecodedImage {
   /** Pixels used for preview + edits (may be downscaled). */
@@ -7,6 +12,17 @@ export interface DecodedImage {
   /** Intrinsic file dimensions before any downscale. */
   originalWidth: number;
   originalHeight: number;
+  /** Long-edge cap used for this decode. */
+  workingMaxEdge: number;
+}
+
+export interface PreviewSizeHint {
+  /** CSS pixel width of the image viewport. */
+  viewportWidth: number;
+  /** CSS pixel height of the image viewport. */
+  viewportHeight: number;
+  /** window.devicePixelRatio (clamped internally). */
+  devicePixelRatio?: number;
 }
 
 interface Size {
@@ -15,29 +31,85 @@ interface Size {
 }
 
 /**
- * Decode a JPEG/PNG into a working ImageData capped at {@link MAX_WORKING_EDGE}.
+ * Choose a working long-edge for the preview buffer.
  *
- * Prefer decoding already-resized via `createImageBitmap` options so we never
- * materialise a multi‑megapixel bitmap in WKWebView (the previous hang source).
+ * Rule: ~1.15× the longest viewport edge × DPR, clamped to
+ * [MIN_WORKING_EDGE, MAX_WORKING_EDGE]. Never exceeds the source long edge.
+ * Computed once per open — not on every window resize.
  */
-export async function decodeImageFile(file: File): Promise<DecodedImage> {
-  return withTimeout(decodeImageFileInner(file), 12_000, "Timed out opening image.");
+export function computeWorkingMaxEdge(
+  hint: PreviewSizeHint | null | undefined,
+  sourceLongEdge?: number,
+): number {
+  const dpr = Math.min(2, Math.max(1, hint?.devicePixelRatio ?? 1));
+  const vw = Math.max(1, hint?.viewportWidth ?? 900);
+  const vh = Math.max(1, hint?.viewportHeight ?? 700);
+  const displayLong = Math.max(vw, vh) * dpr;
+  let edge = Math.round(displayLong * 1.15);
+  edge = Math.min(MAX_WORKING_EDGE, Math.max(MIN_WORKING_EDGE, edge));
+  if (sourceLongEdge && sourceLongEdge > 0) {
+    edge = Math.min(edge, sourceLongEdge);
+  }
+  return edge;
 }
 
-async function decodeImageFileInner(file: File): Promise<DecodedImage> {
+/**
+ * Decode a JPEG/PNG into a working ImageData capped by an adaptive long edge.
+ *
+ * Prefer decoding already-resized via `createImageBitmap` so we never
+ * materialise a multi‑megapixel bitmap in WKWebView.
+ */
+export async function decodeImageFile(
+  file: File,
+  hint?: PreviewSizeHint | null,
+): Promise<DecodedImage> {
+  return withTimeout(
+    decodeImageFileInner(file, hint),
+    12_000,
+    "Timed out opening image.",
+  );
+}
+
+async function decodeImageFileInner(
+  file: File,
+  hint?: PreviewSizeHint | null,
+): Promise<DecodedImage> {
+  const endAll = perfTime("decodeImageFile total");
+  const endProbe = perfTime("probeImageSize");
   const probed = await probeImageSize(file);
+  endProbe();
+
+  const sourceLong = probed
+    ? Math.max(probed.width, probed.height)
+    : undefined;
+  const maxEdge = computeWorkingMaxEdge(hint, sourceLong);
+  perfLog("workingMaxEdge", { maxEdge, probed, hint });
+
   if (probed) {
-    const target = fitWithin(probed, MAX_WORKING_EDGE);
+    const target = fitWithin(probed, maxEdge);
     try {
-      return await decodeWithBitmapResize(file, probed, target);
-    } catch {
+      const endBmp = perfTime("createImageBitmap+getImageData");
+      const decoded = await decodeWithBitmapResize(file, probed, target, maxEdge);
+      endBmp();
+      endAll();
+      return decoded;
+    } catch (error) {
+      perfLog("createImageBitmap failed; falling back", error);
       // Fall through to element path.
     }
-    return decodeWithHtmlImage(file, probed, target);
+    const endHtml = perfTime("htmlImage+getImageData");
+    const decoded = await decodeWithHtmlImage(file, probed, target, maxEdge);
+    endHtml();
+    endAll();
+    return decoded;
   }
 
   // Unknown container — last-resort path (still capped on draw).
-  return decodeWithHtmlImage(file);
+  const endHtml = perfTime("htmlImage fallback");
+  const decoded = await decodeWithHtmlImage(file, undefined, undefined, maxEdge);
+  endHtml();
+  endAll();
+  return decoded;
 }
 
 function withTimeout<T>(
@@ -60,31 +132,66 @@ function withTimeout<T>(
   });
 }
 
+function supportsBitmapOrientation(): boolean {
+  // Feature-detect the options bag; older WebKit may ignore unknown keys.
+  return typeof createImageBitmap === "function";
+}
+
 async function decodeWithBitmapResize(
   file: File,
   original: Size,
   target: Size,
+  workingMaxEdge: number,
 ): Promise<DecodedImage> {
-  const bitmap = await createImageBitmap(file, {
-    resizeWidth: target.width,
-    resizeHeight: target.height,
-    resizeQuality: "medium",
-  });
+  if (!supportsBitmapOrientation()) {
+    throw new Error("createImageBitmap unavailable");
+  }
+
+  // Prefer oriented + resized decode. If the options object is rejected,
+  // retry with resize only, then without options.
+  let bitmap: ImageBitmap;
   try {
-    const width = bitmap.width;
-    const height = bitmap.height;
+    bitmap = await createImageBitmap(file, {
+      resizeWidth: target.width,
+      resizeHeight: target.height,
+      resizeQuality: "high",
+      imageOrientation: "from-image",
+    } as ImageBitmapOptions);
+  } catch {
+    try {
+      bitmap = await createImageBitmap(file, {
+        resizeWidth: target.width,
+        resizeHeight: target.height,
+        resizeQuality: "high",
+      });
+    } catch {
+      bitmap = await createImageBitmap(file);
+    }
+  }
+
+  try {
+    // If options were ignored and we got full-res, draw into the target size.
+    const needsScale =
+      bitmap.width > target.width + 1 || bitmap.height > target.height + 1;
+    const drawW = needsScale ? target.width : bitmap.width;
+    const drawH = needsScale ? target.height : bitmap.height;
+
     const canvas = document.createElement("canvas");
-    canvas.width = width;
-    canvas.height = height;
+    canvas.width = drawW;
+    canvas.height = drawH;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) {
       throw new Error("Could not create canvas context");
     }
-    ctx.drawImage(bitmap, 0, 0);
+    ctx.drawImage(bitmap, 0, 0, drawW, drawH);
+    const endGet = perfTime("getImageData");
+    const working = ctx.getImageData(0, 0, drawW, drawH);
+    endGet();
     return {
-      working: ctx.getImageData(0, 0, width, height),
+      working,
       originalWidth: original.width,
       originalHeight: original.height,
+      workingMaxEdge,
     };
   } finally {
     bitmap.close();
@@ -95,6 +202,7 @@ async function decodeWithHtmlImage(
   file: File,
   knownOriginal?: Size,
   knownTarget?: Size,
+  workingMaxEdge: number = MAX_WORKING_EDGE,
 ): Promise<DecodedImage> {
   const url = URL.createObjectURL(file);
   try {
@@ -106,7 +214,9 @@ async function decodeWithHtmlImage(
     if (original.width < 1 || original.height < 1) {
       throw new Error("Image has invalid dimensions.");
     }
-    const target = knownTarget ?? fitWithin(original, MAX_WORKING_EDGE);
+    const target =
+      knownTarget ??
+      fitWithin(original, computeWorkingMaxEdge(null, Math.max(original.width, original.height)));
     const canvas = document.createElement("canvas");
     canvas.width = target.width;
     canvas.height = target.height;
@@ -119,6 +229,7 @@ async function decodeWithHtmlImage(
       working: ctx.getImageData(0, 0, target.width, target.height),
       originalWidth: original.width,
       originalHeight: original.height,
+      workingMaxEdge,
     };
   } finally {
     URL.revokeObjectURL(url);
@@ -149,6 +260,9 @@ function fitWithin(size: Size, maxEdge: number): Size {
 /**
  * Read width/height from JPEG/PNG headers without decoding pixels.
  * Returns null when the container is unsupported or the header is incomplete.
+ *
+ * Note: JPEG SOF dimensions are pre-orientation; createImageBitmap with
+ * `imageOrientation: "from-image"` corrects display orientation on draw.
  */
 export async function probeImageSize(file: File): Promise<Size | null> {
   const bytes = new Uint8Array(await file.slice(0, 128 * 1024).arrayBuffer());

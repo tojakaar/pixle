@@ -27,9 +27,11 @@ export type {
   ImageAnalysis,
 } from "./imageAnalysis";
 export { analyzeImage, analyzeImageSync } from "./imageAnalysis";
-export type { DecodedImage } from "./imageDecode";
+export type { DecodedImage, PreviewSizeHint } from "./imageDecode";
 export {
   MAX_WORKING_EDGE,
+  MIN_WORKING_EDGE,
+  computeWorkingMaxEdge,
   decodeImageFile,
   yieldToUi,
 } from "./imageDecode";

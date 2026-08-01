@@ -29,7 +29,9 @@ import {
   type EditParameters,
   type ImageAnalysis,
   type Look,
+  type PreviewSizeHint,
 } from "./engine";
+import { perfLog, perfTime } from "./engine/perf";
 import { loadSavedLooks, saveLook } from "./looksStorage";
 import "./App.css";
 
@@ -42,20 +44,25 @@ interface LastEditSession {
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const viewportShellRef = useRef<HTMLDivElement>(null);
   const openGenerationRef = useRef(0);
   const exportingRef = useRef(false);
   const holdingBeforeRef = useRef(false);
+  const placeholderUrlRef = useRef<string | null>(null);
   const presentRef = useRef<EditParameters>(
     cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
   );
+  /** Working preview buffer — set once per open; not recopied on slider moves. */
   const [source, setSource] = useState<ImageData | null>(null);
+  /** Immediate object-URL preview of the selected File. */
+  const [placeholderUrl, setPlaceholderUrl] = useState<string | null>(null);
   /** Original file kept for full-resolution export (never mutated). */
   const [sourceFile, setSourceFile] = useState<File | null>(null);
   const [imageAnalysis, setImageAnalysis] = useState<ImageAnalysis | null>(
     null,
   );
   const [fileName, setFileName] = useState<string | null>(null);
-  const [opening, setOpening] = useState(false);
+  const [preparing, setPreparing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [exportStatus, setExportStatus] = useState<string | null>(null);
   const [exportTone, setExportTone] = useState<"ok" | "error">("ok");
@@ -82,9 +89,37 @@ function App() {
     ? diffParameters(lastEdit.before, lastEdit.after)
     : [];
 
+  function revokePlaceholderUrl() {
+    if (placeholderUrlRef.current) {
+      URL.revokeObjectURL(placeholderUrlRef.current);
+      placeholderUrlRef.current = null;
+    }
+    setPlaceholderUrl(null);
+  }
+
+  useEffect(() => {
+    return () => {
+      if (placeholderUrlRef.current) {
+        URL.revokeObjectURL(placeholderUrlRef.current);
+        placeholderUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  function measurePreviewHint(): PreviewSizeHint {
+    const el = viewportShellRef.current;
+    const rect = el?.getBoundingClientRect();
+    return {
+      viewportWidth: Math.max(1, rect?.width ?? window.innerWidth * 0.65),
+      viewportHeight: Math.max(1, rect?.height ?? window.innerHeight * 0.6),
+      devicePixelRatio: window.devicePixelRatio || 1,
+    };
+  }
+
   async function handleFileChange(fileList: FileList | null) {
     const file = fileList?.[0];
-    if (!file || opening || exportingRef.current) return;
+    // Allow replacing an image while prepare is running; only block during export.
+    if (!file || exportingRef.current) return;
 
     const accepted =
       file.type === "image/jpeg" ||
@@ -97,39 +132,63 @@ function App() {
     }
 
     const generation = ++openGenerationRef.current;
-    setOpening(true);
+    const endOpen = perfTime("open image pipeline");
+
+    // —— Immediate placeholder (no decode wait) ——
+    revokePlaceholderUrl();
+    const objectUrl = URL.createObjectURL(file);
+    placeholderUrlRef.current = objectUrl;
+    setPlaceholderUrl(objectUrl);
+    setSource(null);
+    setSourceFile(file);
+    setFileName(file.name);
+    setImageAnalysis(null);
+    setHistory(createEditHistory());
+    setLastEdit(null);
     setExportStatus(null);
     setShowingBefore(false);
     setBeforeLatched(false);
     holdingBeforeRef.current = false;
-    setLastEdit(null);
     setEditorSessionKey((key) => key + 1);
+    setPreparing(true);
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+
+    // Let the placeholder paint before heavy decode work.
+    await yieldToUi();
+    if (generation !== openGenerationRef.current) return;
 
     try {
-      const decoded = await decodeImageFile(file);
+      const hint = measurePreviewHint();
+      perfLog("preview hint", hint);
+      const decoded = await decodeImageFile(file, hint);
       if (generation !== openGenerationRef.current) return;
 
-      // Sync analysis is cheap on the working buffer — enable Ask pixle immediately.
       const quickAnalysis = analyzeImageSync(decoded.working, {
         width: decoded.originalWidth,
         height: decoded.originalHeight,
       });
 
       setSource(decoded.working);
-      setSourceFile(file);
       setImageAnalysis(quickAnalysis);
-      setFileName(file.name);
-      setHistory(createEditHistory());
-      // Leave Opening as soon as pixels are shown; analysis continues below.
-      setOpening(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = "";
-      }
+      setPreparing(false);
+      endOpen();
+
+      // Drop the object URL once the editable canvas owns the view.
+      requestAnimationFrame(() => {
+        if (generation !== openGenerationRef.current) return;
+        if (placeholderUrlRef.current === objectUrl) {
+          URL.revokeObjectURL(objectUrl);
+          placeholderUrlRef.current = null;
+          setPlaceholderUrl(null);
+        }
+      });
 
       await yieldToUi();
       if (generation !== openGenerationRef.current) return;
 
-      // Optional face enrichment; never clears the quick analysis on failure.
       try {
         const analysis = await analyzeImage(decoded.working, {
           width: decoded.originalWidth,
@@ -140,14 +199,20 @@ function App() {
       } catch {
         // Keep quickAnalysis already applied.
       }
-    } catch {
+    } catch (error) {
+      perfLog("open image failed", error);
       if (generation === openGenerationRef.current) {
+        revokePlaceholderUrl();
+        setSource(null);
+        setSourceFile(null);
+        setFileName(null);
+        setImageAnalysis(null);
+        setPreparing(false);
         window.alert("Could not open that image.");
       }
     } finally {
-      // Safety net: never leave Opening stuck after a failed/cancelled open.
       if (generation === openGenerationRef.current) {
-        setOpening(false);
+        setPreparing(false);
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
         }
@@ -156,7 +221,7 @@ function App() {
   }
 
   function openImagePicker() {
-    if (opening) return;
+    if (exportingRef.current) return;
     fileInputRef.current?.click();
   }
 
@@ -274,7 +339,7 @@ function App() {
 
   async function handleExport() {
     // Use a ref so a second click before re-render cannot start another export.
-    if (!sourceFile || exportingRef.current || opening) return;
+    if (!sourceFile || exportingRef.current || preparing || !source) return;
 
     const exportOptions = {
       sourceFile,
@@ -371,8 +436,9 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [source]);
 
-  const imageReady = Boolean(source) && !opening;
-  const controlsDisabled = !source || opening || exporting;
+  const imageReady = Boolean(source) && !preparing;
+  const hasDocument = Boolean(sourceFile);
+  const controlsDisabled = !source || preparing || exporting;
   const canSaveLook =
     imageReady && !parametersEqual(params, DEFAULT_EDIT_PARAMETERS);
 
@@ -391,15 +457,18 @@ function App() {
           <button
             type="button"
             className="toolbar__open"
-            disabled={opening || exporting}
+            disabled={exporting}
             onClick={openImagePicker}
           >
-            {opening ? "Opening…" : "Open Image"}
+            Open Image
           </button>
           {fileName ? (
             <span className="toolbar__filename" title={fileName}>
               {fileName}
             </span>
+          ) : null}
+          {preparing ? (
+            <span className="toolbar__prepare-status">Preparing editor…</span>
           ) : null}
           {exportStatus ? (
             <span
@@ -440,12 +509,16 @@ function App() {
               onToggleBefore={handleToggleBefore}
             />
           ) : null}
-          <ImageViewport
-            source={source}
-            params={displayParams}
-            onOpenImage={openImagePicker}
-            comparing={showingBefore}
-          />
+          <div className="workspace__viewport" ref={viewportShellRef}>
+            <ImageViewport
+              source={source}
+              placeholderUrl={placeholderUrl}
+              preparing={preparing && hasDocument}
+              params={displayParams}
+              onOpenImage={openImagePicker}
+              comparing={showingBefore}
+            />
+          </div>
           <AiEditorPanel
             key={editorSessionKey}
             params={params}
