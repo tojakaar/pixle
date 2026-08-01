@@ -153,7 +153,8 @@ You never expose chain-of-thought. Return structured EditParameters JSON only.
 You receive:
 1. ImageAnalysis — local metadata (histogram, colour temperature, dominant colours, highlight/shadow clipping, dimensions, faces when available). Use it as your light-table read of the file.
 2. Current EditParameters — the active, non-destructive baseline. Adjustments are incremental from these values.
-3. The user's instruction — interpret the aesthetic or technical goal.
+3. EditSession context (optional) — the active prior EditAction plus a few recent action summaries (target, summary, key deltas). Use this for follow-ups. Do NOT invent image history beyond what is provided.
+4. The user's instruction — interpret the aesthetic or technical goal, including conversational follow-ups.
 
 Return one JSON object only (no markdown, no commentary outside JSON).
 
@@ -220,13 +221,30 @@ Optional:
   For global looks ("cinematic", "warm sunset", "recover highlights", "add grain") set target to null.
   You only NAME the target — Pixle's local Segmenter produces the mask. Never invent pixel regions.
   Prefer sky / person / vegetation / water / buildings / ground / background when they fit. Prefer null when unsure.
-- edit_summary: a short glance phrase for the UI (about 3–7 words, roughly ≤45 characters). Not a full sentence. Never start with "Applied". No trailing ellipsis. Examples: "Warm Kodak Gold", "Muted greens", "Soft summer film", "Fine monochrome grain", "Darker sky", "Warm skin, cool shadows". Explanatory only — never applied to pixels. Detailed rationale belongs nowhere in the JSON.
+- intent: one of edit | adjust_previous | undo_previous | redo_previous | clarify (default edit).
+  - edit: normal new adjustment (return full EditParameters + optional target).
+  - adjust_previous: amplify/reduce/tweak the ACTIVE prior EditAction only. Set adjust_factor (e.g. 1.25 more, 0.65 less). Keep the same target as the active action (or set reference_target). Still return full EditParameters as the desired under-mask grade.
+  - undo_previous / redo_previous: conversational undo/redo of the last session action. Return current parameters unchanged.
+  - clarify: the follow-up is ambiguous (e.g. "more" with no clear active target, or "sky or trees?"). Set clarification to ONE short question. Return current parameters unchanged. NEVER guess which prior edit the user meant.
+- adjust_factor: number used with intent=adjust_previous (typical 0.4…1.6).
+- reference_target: optional prior region label when adjusting a non-active action.
+- clarification: short UI question when intent=clarify (e.g. "Do you mean the sky or the trees?").
+- edit_summary: a short glance phrase for the UI (about 3–7 words, roughly ≤45 characters). Not a full sentence. Never start with "Applied". No trailing ellipsis. Examples: "Warm Kodak Gold", "Muted greens", "Darker sky", "A little more sky". Explanatory only — never applied to pixels.
+
+## Conversational follow-ups
+- "a little more" / "more" / "stronger" → intent=adjust_previous, adjust_factor>1, same target as active action.
+- "not that much" / "less" / "softer" → intent=adjust_previous, adjust_factor<1.
+- "make it warmer" / "cool it instead" when an active local edit exists → adjust that action (temperature), same target.
+- "undo that" / "redo that" → undo_previous / redo_previous.
+- If the user asks for a sub-region we cannot segment (e.g. "only the roofs" when only buildings exists): set intent=clarify OR keep the parent region (buildings) with an edit_summary that states the limitation — do not invent a roof mask.
+- If multiple recent actions could match and the user is vague → intent=clarify. Never guess.
 
 Do not return any other keys (no image data, masks, histograms, analysis fields, presets, or reasoning fields).
 
 ## Editing principles
 - Read the request as photographic intent (mood, story, print goal), not literal keywords.
 - Always consult ImageAnalysis before deciding.
+- When EditSession context is present, prefer adjusting the active action for relative follow-ups instead of starting an unrelated global grade.
 - Make coordinated multi-parameter moves; parameters interact.
 - Prefer moderate, printable adjustments unless the user asks for a strong look or a reset.
 - Avoid clipping highlights further; when already clipped, prioritise recovery (negative highlights/whites).
@@ -236,6 +254,33 @@ Do not return any other keys (no image data, masks, histograms, analysis fields,
 - Local target edits: return the full EditParameters that should apply INSIDE the named region (incremental from current). Outside the region Pixle keeps the previous grade.
 - If the instruction is unrelated to photo editing, return the current parameters unchanged (edit_summary may say so).
 "#;
+
+/// Compact prior-action summary for conversational follow-ups.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditActionSummaryDto {
+    pub id: String,
+    pub target: Option<String>,
+    pub target_label: String,
+    pub summary: String,
+    pub changes: Vec<EditChangeLineDto>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditChangeLineDto {
+    pub key: String,
+    pub label: String,
+    pub formatted: String,
+}
+
+/// Active + recent EditSession actions (no masks / no pixels).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditSessionContextDto {
+    pub active_action: Option<EditActionSummaryDto>,
+    pub recent_actions: Vec<EditActionSummaryDto>,
+}
 
 /// Result of an AI edit: slider parameters, optional semantic target label, and summary.
 /// Only `parameters` (+ optional `target` label) are applied — never pixels or masks.
@@ -249,18 +294,28 @@ pub struct EditFromPromptResult {
     /// Optional model explanation; never used as an image input.
     #[serde(rename = "edit_summary", skip_serializing_if = "Option::is_none")]
     pub edit_summary: Option<String>,
+    /// Conversational intent relative to the EditSession.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    #[serde(rename = "adjust_factor", skip_serializing_if = "Option::is_none")]
+    pub adjust_factor: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clarification: Option<String>,
+    #[serde(rename = "reference_target", skip_serializing_if = "Option::is_none")]
+    pub reference_target: Option<String>,
 }
 
 /// Interpret a natural-language edit prompt via Gemini, Anthropic, or OpenAI-compatible APIs.
 ///
 /// Credentials stay on the Rust side. Prefer Google AI Studio (`GEMINI_API_KEY` /
 /// `GOOGLE_API_KEY`), or use `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`. Image understanding
-/// is text metadata only.
+/// is text metadata only. Optional `session_context` enables conversational follow-ups.
 #[tauri::command]
 pub async fn edit_from_prompt(
     prompt: String,
     current_parameters: EditParameters,
     image_analysis: ImageAnalysis,
+    session_context: Option<EditSessionContextDto>,
 ) -> Result<EditFromPromptResult, String> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
@@ -272,9 +327,20 @@ pub async fn edit_from_prompt(
     let params_json = serde_json::to_string_pretty(&current_parameters)
         .map_err(|e| format!("Failed to serialize current parameters: {e}"))?;
 
+    let session_block = match session_context {
+        Some(ctx) => {
+            let session_json = serde_json::to_string_pretty(&ctx)
+                .map_err(|e| format!("Failed to serialize session context: {e}"))?;
+            format!(
+                "\n\nEditSession context JSON (active + recent actions only — not an image):\n{session_json}"
+            )
+        }
+        None => String::new(),
+    };
+
     let user_message = format!(
         "ImageAnalysis JSON (local metadata only — not an image):\n{analysis_json}\n\n\
-         Current EditParameters JSON:\n{params_json}\n\n\
+         Current EditParameters JSON:\n{params_json}{session_block}\n\n\
          User instruction:\n{trimmed}"
     );
 
@@ -747,8 +813,14 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
         .ok_or_else(|| "EditParameters JSON must be an object.".to_string())?;
 
     // Reject unexpected payload shapes (e.g. image blobs / masks) before applying.
-    // `edit_summary` and `target` are the only optional non-parameter fields allowed.
-    const OPTIONAL: [&str; 2] = ["edit_summary", "target"];
+    const OPTIONAL: [&str; 6] = [
+        "edit_summary",
+        "target",
+        "intent",
+        "adjust_factor",
+        "clarification",
+        "reference_target",
+    ];
 
     for key in SCALAR_KEYS {
         if !obj.contains_key(key) {
@@ -778,6 +850,23 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
     };
 
     let target = parse_target(obj.get("target"))?;
+    let intent = parse_intent(obj.get("intent"))?;
+    let adjust_factor = parse_adjust_factor(obj.get("adjust_factor"))?;
+    let clarification = match obj.get("clarification") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.chars().take(160).collect::<String>())
+            }
+        }
+        Some(_) => {
+            return Err("Field `clarification` must be a string when present.".to_string());
+        }
+    };
+    let reference_target = parse_target(obj.get("reference_target"))?;
 
     let hsl = parse_hsl(obj.get("hsl").unwrap())?;
 
@@ -809,7 +898,44 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
         },
         target,
         edit_summary,
+        intent,
+        adjust_factor,
+        clarification,
+        reference_target,
     })
+}
+
+fn parse_intent(value: Option<&Value>) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let normalized = s.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "" => Ok(None),
+                "edit" | "adjust_previous" | "undo_previous" | "redo_previous" | "clarify" => {
+                    Ok(Some(normalized))
+                }
+                _ => Ok(Some("edit".to_string())),
+            }
+        }
+        Some(_) => Err("Field `intent` must be a string when present.".to_string()),
+    }
+}
+
+fn parse_adjust_factor(value: Option<&Value>) -> Result<Option<f64>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => {
+            let v = n.as_f64().ok_or_else(|| {
+                "Field `adjust_factor` must be a finite number.".to_string()
+            })?;
+            if !v.is_finite() {
+                return Err("Field `adjust_factor` must be a finite number.".to_string());
+            }
+            Ok(Some(v.clamp(0.05, 3.0)))
+        }
+        Some(_) => Err("Field `adjust_factor` must be a finite number.".to_string()),
+    }
 }
 
 const SEMANTIC_TARGETS: [&str; 22] = [
@@ -1100,9 +1226,68 @@ mod tests {
         }
 
         let current: EditParameters = serde_json::from_value(sample_full_params()).unwrap();
-        let next = edit_from_prompt("make it brighter".into(), current, sample_analysis())
-            .await
-            .expect("live AI edit should succeed");
+        let next = edit_from_prompt(
+            "make it brighter".into(),
+            current,
+            sample_analysis(),
+            None,
+        )
+        .await
+        .expect("live AI edit should succeed");
         assert!(next.parameters.exposure > 0.0);
+    }
+
+    #[test]
+    fn parse_accepts_conversational_intent_fields() {
+        let mut value = sample_full_params();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("intent".into(), json!("adjust_previous"));
+        obj.insert("adjust_factor".into(), json!(1.25));
+        obj.insert("reference_target".into(), json!("sky"));
+        obj.insert("edit_summary".into(), json!("A little more sky"));
+        let parsed = parse_edit_response(&value).unwrap();
+        assert_eq!(parsed.intent.as_deref(), Some("adjust_previous"));
+        assert_eq!(parsed.adjust_factor, Some(1.25));
+        assert_eq!(parsed.reference_target.as_deref(), Some("sky"));
+    }
+
+    #[test]
+    fn parse_accepts_clarify_intent() {
+        let mut value = sample_full_params();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("intent".into(), json!("clarify"));
+        obj.insert(
+            "clarification".into(),
+            json!("Do you mean the sky or the trees?"),
+        );
+        let parsed = parse_edit_response(&value).unwrap();
+        assert_eq!(parsed.intent.as_deref(), Some("clarify"));
+        assert_eq!(
+            parsed.clarification.as_deref(),
+            Some("Do you mean the sky or the trees?")
+        );
+    }
+
+    #[test]
+    fn session_context_dto_serializes_without_masks() {
+        let ctx = EditSessionContextDto {
+            active_action: Some(EditActionSummaryDto {
+                id: "a1".into(),
+                target: Some("sky".into()),
+                target_label: "Sky".into(),
+                summary: "Darken sky".into(),
+                changes: vec![EditChangeLineDto {
+                    key: "exposure".into(),
+                    label: "Exposure".into(),
+                    formatted: "-0.4".into(),
+                }],
+            }),
+            recent_actions: vec![],
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(json.contains("activeAction"));
+        assert!(json.contains("Darken sky"));
+        assert!(!json.contains("mask"));
+        assert!(!json.contains("pixels"));
     }
 }

@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import type { EditParameters } from "../engine";
-import type { ParameterChange } from "../engine/editDiff";
+import type { ActionHistoryGroup, EditParameters } from "../engine";
 import type { Look } from "../engine/looks";
 import { IntensityControl } from "./IntensityControl";
 import { ChangesTab } from "./sidebar/ChangesTab";
@@ -18,7 +17,9 @@ interface RightSidebarProps {
   onReset?: () => void;
   intensity: number | null;
   onIntensityChange: (value: number) => void;
-  changes: ParameterChange[];
+  actionGroups: ActionHistoryGroup[];
+  activeActionId: string | null;
+  onSelectAction: (actionId: string) => void;
   builtinLooks: Look[];
   customLooks: Look[];
   canSaveLook: boolean;
@@ -34,8 +35,19 @@ const TABS: { id: SidebarTabId; label: string }[] = [
   { id: "changes", label: "Changes" },
 ];
 
-function changesSignature(changes: ParameterChange[]): string {
-  return changes.map((c) => `${c.key}:${c.formatted}`).join("|");
+function actionsSignature(
+  groups: ActionHistoryGroup[],
+  activeActionId: string | null,
+): string {
+  return (
+    `${activeActionId ?? ""}::` +
+    groups
+      .map(
+        (g) =>
+          `${g.targetLabel}:${g.actions.map((a) => a.id + a.summary).join(",")}`,
+      )
+      .join("|")
+  );
 }
 
 /**
@@ -49,7 +61,9 @@ export function RightSidebar({
   onReset,
   intensity,
   onIntensityChange,
-  changes,
+  actionGroups,
+  activeActionId,
+  onSelectAction,
   builtinLooks,
   customLooks,
   canSaveLook,
@@ -61,8 +75,8 @@ export function RightSidebar({
   const seenSignatureRef = useRef("");
 
   useEffect(() => {
-    const signature = changesSignature(changes);
-    if (!signature) {
+    const signature = actionsSignature(actionGroups, activeActionId);
+    if (!actionGroups.length) {
       setChangesBadge(false);
       seenSignatureRef.current = "";
       return;
@@ -73,14 +87,13 @@ export function RightSidebar({
       setChangesBadge(false);
       return;
     }
-    // New AI/look deltas arrived while on another tab — nudge, don't auto-switch.
     setChangesBadge(true);
-  }, [changes, activeTab]);
+  }, [actionGroups, activeActionId, activeTab]);
 
   function selectTab(id: SidebarTabId) {
     setActiveTab(id);
     if (id === "changes") {
-      seenSignatureRef.current = changesSignature(changes);
+      seenSignatureRef.current = actionsSignature(actionGroups, activeActionId);
       setChangesBadge(false);
     }
   }
@@ -155,7 +168,13 @@ export function RightSidebar({
             onSave={onSaveLook}
           />
         ) : null}
-        {activeTab === "changes" ? <ChangesTab changes={changes} /> : null}
+        {activeTab === "changes" ? (
+          <ChangesTab
+            groups={actionGroups}
+            activeActionId={activeActionId}
+            onSelectAction={onSelectAction}
+          />
+        ) : null}
       </div>
     </aside>
   );

@@ -83,6 +83,30 @@ export {
   shortenEditSummary,
 } from "./editSummary";
 export type {
+  ActionHistoryGroup,
+  EditAction,
+  EditActionSummary,
+  EditSession,
+  EditSessionContext,
+} from "./editSession";
+export {
+  actionIntensitySession,
+  appendEditAction,
+  buildSessionContext,
+  conversationalRedo,
+  conversationalUndo,
+  createEditAction,
+  createEditSession,
+  getActiveAction,
+  groupActionsForHistory,
+  scaleActionParameters,
+  selectEditAction,
+  summarizeAction,
+  targetDisplayLabel,
+} from "./editSession";
+export type { FollowUpKind, ResolvedFollowUp } from "./followUp";
+export { looksLikeFollowUp, tryResolveFollowUp } from "./followUp";
+export type {
   ImplementedSemanticLabel,
   Mask,
   MaskBounds,
