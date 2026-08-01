@@ -78,7 +78,9 @@ export function ImageViewport({
   onCanvasReadyRef.current = onCanvasReady;
   onPlaceholderRetiredRef.current = onPlaceholderRetired;
 
-  // New open / new placeholder URL → keep the img up until the canvas paints.
+  // New open invalidates the previous handoff. Do NOT reset paintedOpenId when
+  // the parent clears placeholderUrl after a successful fade — that used to
+  // bring the spinner back forever on an already-ready canvas.
   useEffect(() => {
     handedOffOpenIdRef.current = null;
     setPaintedOpenId(null);
@@ -88,7 +90,14 @@ export function ImageViewport({
       fadeTimerRef.current = null;
     }
     setPlaceholderLayer(placeholderUrl);
-  }, [openRequestId, placeholderUrl]);
+  }, [openRequestId]);
+
+  // Keep the overlay in sync when a newer placeholder URL arrives for the
+  // same open id (should be rare), without clearing the paint gate.
+  useEffect(() => {
+    if (!placeholderUrl) return;
+    setPlaceholderLayer(placeholderUrl);
+  }, [placeholderUrl]);
 
   useEffect(() => {
     return () => {
