@@ -5,12 +5,17 @@ import {
   renderEditedImageBytes,
   type ExportFormat,
 } from "./engine/exportImage";
-import type { EditParameters } from "./engine";
+import type { EditParameters, Mask, MaskProvider } from "./engine";
 
 export interface ExportEditedImageOptions {
   sourceFile: File;
   params: EditParameters;
   originalFileName: string | null;
+  /** Semantic local-edit fields — export reuses the same MaskProvider. */
+  maskTarget?: string | null;
+  baseParameters?: EditParameters | null;
+  maskProvider?: MaskProvider | null;
+  mask?: Mask | null;
 }
 
 export type ExportResult =
@@ -101,6 +106,10 @@ export async function writeExport(
     params: options.params,
     format: destination.format,
     jpegQuality: 0.95,
+    maskTarget: options.maskTarget,
+    baseParameters: options.baseParameters,
+    maskProvider: options.maskProvider,
+    mask: options.mask,
   });
 
   // Dialog-selected paths are added to the fs scope; writeFile transfers bytes
@@ -130,6 +139,10 @@ async function exportViaBrowserDownload(
     params: options.params,
     format: preferredFormat,
     jpegQuality: 0.95,
+    maskTarget: options.maskTarget,
+    baseParameters: options.baseParameters,
+    maskProvider: options.maskProvider,
+    mask: options.mask,
   });
   const mime = preferredFormat === "png" ? "image/png" : "image/jpeg";
   const blob = new Blob([bytes], { type: mime });

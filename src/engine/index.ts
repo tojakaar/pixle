@@ -19,8 +19,10 @@ export {
   createDefaultHsl,
   hslColorLabel,
   normalizeEditParameters,
+  parametersEqual,
 } from "./EditParameters";
 export { applyEdits, isIdentityEdit } from "./render";
+export type { ApplyEditsOptions } from "./render";
 export type {
   DetectedFace,
   DominantColour,
@@ -52,11 +54,19 @@ export {
   canUndo,
   commitEdit,
   createEditHistory,
-  parametersEqual,
   redoEdit,
   resetEdit,
   undoEdit,
+  editDocumentsEqual,
 } from "./editHistory";
+export type { EditDocument } from "./EditDocument";
+export {
+  cloneEditDocument,
+  createGlobalEditDocument,
+  createLocalEditDocument,
+  documentEditParameters,
+  documentGlobalParameters,
+} from "./EditDocument";
 export type { ParameterChange } from "./editDiff";
 export {
   EDIT_PARAMETER_KEYS,
@@ -72,3 +82,23 @@ export {
   EDIT_SUMMARY_MAX_WORDS,
   shortenEditSummary,
 } from "./editSummary";
+export type {
+  Mask,
+  MaskBounds,
+  MaskCollection,
+  MaskProvider,
+  Segmenter,
+  SegmenterKind,
+  SemanticTargetLabel,
+} from "./mask";
+export {
+  SEMANTIC_TARGET_LABELS,
+  createDefaultSegmenter,
+  createMaskProvider,
+  createSkyHeuristicSegmenter,
+  createStubSegmenter,
+  emptyMaskCollection,
+  findMaskByLabel,
+  isSemanticTargetLabel,
+  resampleMask,
+} from "./mask";

@@ -147,6 +147,7 @@ enum LlmProvider {
 
 const SYSTEM_PROMPT: &str = r#"You are an experienced professional photo editor working inside Pixle.
 You think in photographic intent, not keyword matching. You never modify, generate, describe as binary, or return image pixels.
+You never segment images, invent masks, return bounding boxes, polygons, bitmaps, or pixel coordinates.
 You never expose chain-of-thought. Return structured EditParameters JSON only.
 
 You receive:
@@ -157,7 +158,7 @@ You receive:
 Return one JSON object only (no markdown, no commentary outside JSON).
 
 ## Output schema
-Include every key exactly once.
+Include every edit-parameter key exactly once.
 
 Basic tone:
 - exposure: -2 to 2 (EV stops)
@@ -211,9 +212,15 @@ Examples of intent → parameters:
 - "vibrance" vs "saturation": vibrance for lively but natural colour; saturation for even global chroma push/pull
 
 Optional:
-- edit_summary: a short glance phrase for the UI (about 3–7 words, roughly ≤45 characters). Not a full sentence. Never start with "Applied". No trailing ellipsis. Examples: "Warm Kodak Gold", "Muted greens", "Soft summer film", "Fine monochrome grain", "Warm skin, cool shadows". Explanatory only — never applied to pixels. Detailed rationale belongs nowhere in the JSON.
+- target: semantic region label for a LOCAL edit, or null / "global" for a whole-image edit.
+  Allowed labels: sky, person, face, skin, hair, eyes, clouds, mountains, water, trees, grass, road, buildings, food, cup, flowers, animals, cars, foreground, background.
+  Use a target ONLY when the user clearly asks to change one region (e.g. "darken the sky", "brighten my face", "mute the trees").
+  For global looks ("cinematic", "warm sunset", "recover highlights", "add grain") set target to null.
+  You only NAME the target — Pixle's local Segmenter produces the mask. Never invent pixel regions.
+  Prefer "sky" when the user mentions sky / clouds-in-sky. Prefer null when unsure.
+- edit_summary: a short glance phrase for the UI (about 3–7 words, roughly ≤45 characters). Not a full sentence. Never start with "Applied". No trailing ellipsis. Examples: "Warm Kodak Gold", "Muted greens", "Soft summer film", "Fine monochrome grain", "Darker sky", "Warm skin, cool shadows". Explanatory only — never applied to pixels. Detailed rationale belongs nowhere in the JSON.
 
-Do not return any other keys (no image data, histograms, analysis fields, presets, or reasoning fields).
+Do not return any other keys (no image data, masks, histograms, analysis fields, presets, or reasoning fields).
 
 ## Editing principles
 - Read the request as photographic intent (mood, story, print goal), not literal keywords.
@@ -224,15 +231,19 @@ Do not return any other keys (no image data, histograms, analysis fields, preset
 - Avoid crushing shadow detail unless clearly requested.
 - When faces are detected (or the request is a portrait): keep skin believable — prefer vibrance over saturation, use orange/red HSL carefully, restrain extreme temperature/tint.
 - Style directions (cinematic, film look, documentary, moody, warm sunset, editorial, natural portrait, vintage, faded summer, cool editorial) are aesthetic goals — translate into tasteful parameter combinations for this specific image.
+- Local target edits: return the full EditParameters that should apply INSIDE the named region (incremental from current). Outside the region Pixle keeps the previous grade.
 - If the instruction is unrelated to photo editing, return the current parameters unchanged (edit_summary may say so).
 "#;
 
-/// Result of an AI edit: slider parameters plus an optional human-readable summary.
-/// Only `parameters` are applied to the image.
+/// Result of an AI edit: slider parameters, optional semantic target label, and summary.
+/// Only `parameters` (+ optional `target` label) are applied — never pixels or masks.
 #[derive(Debug, Clone, Serialize)]
 pub struct EditFromPromptResult {
     #[serde(flatten)]
     pub parameters: EditParameters,
+    /// Semantic region label for local editing, or None for a global edit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// Optional model explanation; never used as an image input.
     #[serde(rename = "edit_summary", skip_serializing_if = "Option::is_none")]
     pub edit_summary: Option<String>,
@@ -733,9 +744,9 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
         .as_object()
         .ok_or_else(|| "EditParameters JSON must be an object.".to_string())?;
 
-    // Reject unexpected payload shapes (e.g. image blobs) before applying.
-    // `edit_summary` is the only optional non-parameter field allowed.
-    const OPTIONAL: [&str; 1] = ["edit_summary"];
+    // Reject unexpected payload shapes (e.g. image blobs / masks) before applying.
+    // `edit_summary` and `target` are the only optional non-parameter fields allowed.
+    const OPTIONAL: [&str; 2] = ["edit_summary", "target"];
 
     for key in SCALAR_KEYS {
         if !obj.contains_key(key) {
@@ -763,6 +774,8 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
             return Err("Field `edit_summary` must be a string when present.".to_string());
         }
     };
+
+    let target = parse_target(obj.get("target"))?;
 
     let hsl = parse_hsl(obj.get("hsl").unwrap())?;
 
@@ -792,8 +805,38 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
             vignette_feather: read_number(obj, "vignetteFeather", 0.0, 100.0)?,
             hsl,
         },
+        target,
         edit_summary,
     })
+}
+
+const SEMANTIC_TARGETS: [&str; 20] = [
+    "sky", "person", "face", "skin", "hair", "eyes", "clouds", "mountains",
+    "water", "trees", "grass", "road", "buildings", "food", "cup", "flowers",
+    "animals", "cars", "foreground", "background",
+];
+
+/// Parse optional `target`. Unknown / global labels become None (global edit).
+fn parse_target(value: Option<&Value>) -> Result<Option<String>, String> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => {
+            let normalized = s.trim().to_ascii_lowercase();
+            if normalized.is_empty()
+                || normalized == "global"
+                || normalized == "none"
+            {
+                return Ok(None);
+            }
+            if SEMANTIC_TARGETS.contains(&normalized.as_str()) {
+                Ok(Some(normalized))
+            } else {
+                // Do not reject the whole edit — fall back to global.
+                Ok(None)
+            }
+        }
+        Some(_) => Err("Field `target` must be a string or null when present.".to_string()),
+    }
 }
 
 fn read_number(
@@ -936,6 +979,30 @@ mod tests {
         let parsed = parse_edit_response(&value).unwrap();
         assert_eq!(parsed.parameters.exposure, 0.2);
         assert_eq!(parsed.edit_summary.as_deref(), Some("Warm Kodak Gold"));
+        assert!(parsed.target.is_none());
+    }
+
+    #[test]
+    fn accepts_optional_semantic_target() {
+        let mut value = sample_full_params();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("exposure".into(), json!(-0.3));
+        obj.insert("target".into(), json!("Sky"));
+        obj.insert("edit_summary".into(), json!("Darker sky"));
+        let parsed = parse_edit_response(&value).unwrap();
+        assert_eq!(parsed.target.as_deref(), Some("sky"));
+        assert_eq!(parsed.edit_summary.as_deref(), Some("Darker sky"));
+    }
+
+    #[test]
+    fn global_target_aliases_become_none() {
+        let mut value = sample_full_params();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("target".into(), json!("global"));
+        let parsed = parse_edit_response(&value).unwrap();
+        assert!(parsed.target.is_none());
     }
 
     #[test]

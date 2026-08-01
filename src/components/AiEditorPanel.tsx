@@ -1,17 +1,21 @@
 import { useRef, useState, type FormEvent } from "react";
-import { editFromPrompt } from "../aiEditor";
+import {
+  editFromPrompt,
+  type EditFromPromptResult,
+} from "../aiEditor";
 import { shortenEditSummary, type EditParameters, type ImageAnalysis } from "../engine";
 
 interface AiEditorPanelProps {
   params: EditParameters;
   imageAnalysis: ImageAnalysis | null;
   disabled: boolean;
-  onApply: (params: EditParameters) => void;
+  onApply: (result: EditFromPromptResult) => void | Promise<void>;
 }
 
 /**
  * Conversational edit controls. Talks to `editFromPrompt` only — LLM access
  * stays in the Tauri backend so the API key never reaches the webview.
+ * Gemini may name a semantic `target`; segmentation stays local.
  */
 export function AiEditorPanel({
   params,
@@ -51,11 +55,13 @@ export function AiEditorPanel({
       if (requestId !== requestIdRef.current) return;
 
       try {
-        onApply(result.parameters);
+        await onApply(result);
         setPrompt("");
         setStatusTone("ok");
+        const summary =
+          shortenEditSummary(result.editSummary) || "Edit applied";
         setStatus(
-          shortenEditSummary(result.editSummary) || "Edit applied",
+          result.target ? `${summary} · ${result.target}` : summary,
         );
       } catch (applyError) {
         // Applying must never leave the panel stuck in Sending…
@@ -111,7 +117,7 @@ export function AiEditorPanel({
               ? "Open an image to edit with AI"
               : !imageAnalysis
                 ? "Preparing image analysis…"
-                : 'Try “cinematic”, “warm sunset”, or “recover the highlights”'
+                : 'Try “darken the sky”, “cinematic”, or “warm sunset”'
           }
           onChange={(e) => setPrompt(e.currentTarget.value)}
           aria-label="Edit instruction"

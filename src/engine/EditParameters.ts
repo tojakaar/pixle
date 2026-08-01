@@ -372,3 +372,26 @@ export function clampHslChannel(
   if (step >= 1) return Math.round(clamped);
   return clamped;
 }
+
+function hslEqual(a: HslAdjustments, b: HslAdjustments): boolean {
+  for (const name of HSL_COLOR_NAMES) {
+    const aa = a[name];
+    const bb = b[name];
+    if (
+      aa.hue !== bb.hue ||
+      aa.saturation !== bb.saturation ||
+      aa.luminance !== bb.luminance
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Deep equality for edit parameter snapshots. */
+export function parametersEqual(a: EditParameters, b: EditParameters): boolean {
+  for (const key of SCALAR_EDIT_KEYS) {
+    if (a[key] !== b[key]) return false;
+  }
+  return hslEqual(a.hsl, b.hsl);
+}
