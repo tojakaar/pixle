@@ -2,8 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import {
   applyEdits,
   isIdentityEdit,
+  paintMaskDebugOverlay,
   type ApplyEditsOptions,
   type EditParameters,
+  type MaskCollection,
 } from "../engine";
 import { openLog } from "../engine/openLog";
 import { perfTime } from "../engine/perf";
@@ -23,6 +25,11 @@ interface ImageViewportProps {
   params: EditParameters;
   /** Optional semantic mask compositing (same engine as export). */
   applyOptions?: ApplyEditsOptions;
+  /**
+   * When non-null, paint a ~40% coloured mask overlay (debug only).
+   * Never used for export. Overlay canvas is pointer-events: none.
+   */
+  debugMasks?: MaskCollection | null;
   /** Opens the JPEG/PNG file picker from the empty state. */
   onOpenImage: () => void;
   /** True while the user is peeking at the untouched original. */
@@ -52,15 +59,18 @@ export function ImageViewport({
   preparing = false,
   params,
   applyOptions,
+  debugMasks = null,
   onOpenImage,
   comparing = false,
   onCanvasReady,
   onPlaceholderRetired,
 }: ImageViewportProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const overlayRef = useRef<HTMLCanvasElement>(null);
   const sourceRef = useRef<ImageData | null>(source);
   const paramsRef = useRef(params);
   const applyOptionsRef = useRef(applyOptions);
+  const debugMasksRef = useRef(debugMasks);
   const openIdRef = useRef(openRequestId);
   const renderGenRef = useRef(0);
   const rafRef = useRef<number | null>(null);
@@ -80,6 +90,7 @@ export function ImageViewport({
   sourceRef.current = source;
   paramsRef.current = params;
   applyOptionsRef.current = applyOptions;
+  debugMasksRef.current = debugMasks;
   openIdRef.current = openRequestId;
   onCanvasReadyRef.current = onCanvasReady;
   onPlaceholderRetiredRef.current = onPlaceholderRetired;
@@ -188,6 +199,28 @@ export function ImageViewport({
         }
 
         ctx.putImageData(frame, 0, 0);
+
+        const overlay = overlayRef.current;
+        const masks = debugMasksRef.current;
+        if (overlay) {
+          if (overlay.width !== current.width || overlay.height !== current.height) {
+            overlay.width = current.width;
+            overlay.height = current.height;
+          }
+          const octx = overlay.getContext("2d");
+          if (octx) {
+            octx.clearRect(0, 0, overlay.width, overlay.height);
+            if (masks && masks.masks.length > 0) {
+              paintMaskDebugOverlay(
+                octx,
+                current.width,
+                current.height,
+                masks.masks,
+              );
+            }
+          }
+        }
+
         openLog(boundOpenId, "canvas swap", {
           w: current.width,
           h: current.height,
@@ -243,7 +276,29 @@ export function ImageViewport({
       }
       renderGenRef.current += 1;
     };
-  }, [source, params, applyOptions, openRequestId]);
+  }, [source, params, applyOptions, debugMasks, openRequestId]);
+
+  // Refresh overlay when debug masks arrive without a full re-edit.
+  useEffect(() => {
+    const overlay = overlayRef.current;
+    const current = sourceRef.current;
+    if (!overlay || !current) return;
+    if (overlay.width !== current.width || overlay.height !== current.height) {
+      overlay.width = current.width;
+      overlay.height = current.height;
+    }
+    const octx = overlay.getContext("2d");
+    if (!octx) return;
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+    if (debugMasks && debugMasks.masks.length > 0) {
+      paintMaskDebugOverlay(
+        octx,
+        current.width,
+        current.height,
+        debugMasks.masks,
+      );
+    }
+  }, [debugMasks, source, openRequestId]);
 
   if (!source && !placeholderUrl && !placeholderLayer) {
     return (
@@ -279,15 +334,22 @@ export function ImageViewport({
       <div className="viewport__stage">
         {/* Canvas mounts under the placeholder as soon as the buffer exists. */}
         {source ? (
-          <canvas
-            ref={canvasRef}
-            className={
-              showPlaceholder && !placeholderFading
-                ? "viewport__canvas viewport__canvas--pending"
-                : "viewport__canvas"
-            }
-            aria-label={comparing ? "Original photo" : "Edited photo preview"}
-          />
+          <>
+            <canvas
+              ref={canvasRef}
+              className={
+                showPlaceholder && !placeholderFading
+                  ? "viewport__canvas viewport__canvas--pending"
+                  : "viewport__canvas"
+              }
+              aria-label={comparing ? "Original photo" : "Edited photo preview"}
+            />
+            <canvas
+              ref={overlayRef}
+              className="viewport__mask-overlay"
+              aria-hidden="true"
+            />
+          </>
         ) : null}
         {showPlaceholder ? (
           <img

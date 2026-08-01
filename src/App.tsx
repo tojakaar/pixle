@@ -28,10 +28,12 @@ import {
   diffParameters,
   documentGlobalParameters,
   editDocumentsEqual,
+  isMaskDebugEnabled,
   lerpParameters,
   parametersEqual,
   redoEdit,
   resetEdit,
+  toggleMaskDebugEnabled,
   undoEdit,
   yieldToUi,
   type ApplyEditsOptions,
@@ -41,6 +43,7 @@ import {
   type ImageAnalysis,
   type Look,
   type Mask,
+  type MaskCollection,
   type PreviewSizeHint,
 } from "./engine";
 import { isAbortError, openLog } from "./engine/openLog";
@@ -74,6 +77,8 @@ function App() {
   const pendingOpenFileRef = useRef<File | null>(null);
   /** Swappable segmentation backend — renderer never depends on this. */
   const maskProviderRef = useRef(createMaskProvider(createDefaultSegmenter()));
+  /** Cancels in-flight background segmentation when opening another image. */
+  const segmentAbortRef = useRef<AbortController | null>(null);
 
   /** Working preview buffer — set once per open; not recopied on slider moves. */
   const [source, setSource] = useState<ImageData | null>(null);
@@ -107,6 +112,12 @@ function App() {
   const [maskStatus, setMaskStatus] = useState<
     "none" | "loading" | "ready" | "missing"
   >("none");
+  /** Full cached MaskCollection for debug overlay (never sent to export). */
+  const [cachedMasks, setCachedMasks] = useState<MaskCollection | null>(null);
+  /** Dev overlay toggle — localStorage / Ctrl+Shift+M / ?debugMasks=1 */
+  const [maskDebugOn, setMaskDebugOn] = useState(() => isMaskDebugEnabled());
+  /** Quiet status for background segmentation (does not block editing). */
+  const [segmentStatus, setSegmentStatus] = useState<string | null>(null);
   /** Bumps after export/reset so in-flight AI panels drop stale busy state. */
   const [editorSessionKey, setEditorSessionKey] = useState(0);
   const [unsavedDialogOpen, setUnsavedDialogOpen] = useState(false);
@@ -168,7 +179,7 @@ function App() {
   }, [editDoc]);
 
   // Resolve / refresh the working-buffer mask whenever the semantic target changes.
-  // Failure or a missing object clears the mask — editing continues globally.
+  // Prefer the session cache (no re-inference). Failure → global fallback.
   useEffect(() => {
     const target = editDoc.maskTarget;
     if (!target || !source) {
@@ -178,6 +189,13 @@ function App() {
     }
 
     let cancelled = false;
+    const cached = maskProviderRef.current.getCachedLabel(target);
+    if (cached) {
+      setActiveMask(cached);
+      setMaskStatus("ready");
+      return;
+    }
+
     setMaskStatus("loading");
     void maskProviderRef.current
       .findLabel(source, target)
@@ -185,6 +203,7 @@ function App() {
         if (cancelled) return;
         setActiveMask(mask);
         setMaskStatus(mask ? "ready" : "missing");
+        setCachedMasks(maskProviderRef.current.getCachedCollection());
       })
       .catch((error) => {
         console.warn("[pixle mask] preview mask resolve failed", error);
@@ -197,6 +216,24 @@ function App() {
       cancelled = true;
     };
   }, [editDoc.maskTarget, source, openRequestId]);
+
+  // Keyboard toggle for the mask debug overlay (does not affect export).
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey) || !event.shiftKey) return;
+      if (event.key.toLowerCase() !== "m") return;
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      if (tag === "input" || tag === "textarea" || target?.isContentEditable) {
+        return;
+      }
+      event.preventDefault();
+      const enabled = toggleMaskDebugEnabled();
+      setMaskDebugOn(enabled);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
 
   // Revoke superseded object URLs only after React commits the new placeholder.
   // This effect runs post-commit, so the visible <img> already uses the new URL.
@@ -310,6 +347,10 @@ function App() {
     setLastEdit(null);
     setActiveMask(null);
     setMaskStatus("none");
+    setCachedMasks(null);
+    setSegmentStatus(null);
+    segmentAbortRef.current?.abort();
+    segmentAbortRef.current = new AbortController();
     maskProviderRef.current.clearCache();
     setExportStatus(null);
     setPrepareError(null);
@@ -370,6 +411,40 @@ function App() {
         h: decoded.working.height,
       });
       endOpen();
+
+      // Background segmentation — never blocks the open path or global editing.
+      const segSignal = segmentAbortRef.current?.signal;
+      setSegmentStatus("Segmenting…");
+      void maskProviderRef.current
+        .prefetch(decoded.working, segSignal)
+        .then((collection) => {
+          if (!isCurrentOpen(requestId) || segSignal?.aborted) return;
+          setCachedMasks(collection);
+          const target = presentRef.current.maskTarget;
+          if (target) {
+            const mask = maskProviderRef.current.getCachedLabel(target);
+            setActiveMask(mask);
+            setMaskStatus(mask ? "ready" : "missing");
+          }
+          if (collection.masks.length > 0) {
+            setSegmentStatus(`Masks ready · ${collection.masks.length}`);
+            window.setTimeout(() => {
+              if (isCurrentOpen(requestId)) setSegmentStatus(null);
+            }, 2200);
+          } else {
+            setSegmentStatus(null);
+          }
+          openLog(requestId, "segmentation cached", {
+            count: collection.masks.length,
+            labels: collection.masks.map((m) => m.label),
+          });
+        })
+        .catch((error) => {
+          if (!isCurrentOpen(requestId) || segSignal?.aborted) return;
+          console.warn("[pixle mask] background segmentation failed", error);
+          setSegmentStatus(null);
+          setCachedMasks(null);
+        });
 
       await yieldToUi();
       if (!isCurrentOpen(requestId) || abortController.signal.aborted) {
@@ -538,7 +613,12 @@ function App() {
 
     if (target && source) {
       try {
-        const mask = await maskProviderRef.current.findLabel(source, target);
+        // Prefer session cache (prefetch); wait on Segmenter only on cache miss.
+        let mask = maskProviderRef.current.getCachedLabel(target);
+        if (!mask) {
+          mask = await maskProviderRef.current.findLabel(source, target);
+          setCachedMasks(maskProviderRef.current.getCachedCollection());
+        }
         if (mask) {
           const baseParameters =
             beforeDoc.maskTarget === target && beforeDoc.baseParameters
@@ -844,6 +924,16 @@ function App() {
           {preparing ? (
             <span className="toolbar__prepare-status">Preparing editor…</span>
           ) : null}
+          {segmentStatus && !preparing ? (
+            <span className="toolbar__prepare-status" title="Background segmentation">
+              {segmentStatus}
+            </span>
+          ) : null}
+          {maskDebugOn ? (
+            <span className="toolbar__prepare-status" title="Ctrl/Cmd+Shift+M to toggle">
+              Mask debug
+            </span>
+          ) : null}
           {prepareError && !preparing ? (
             <span
               className="toolbar__export-status toolbar__export-status--error"
@@ -899,6 +989,7 @@ function App() {
               preparing={preparing && hasDocument}
               params={displayParams}
               applyOptions={previewApplyOptions}
+              debugMasks={maskDebugOn ? cachedMasks : null}
               onOpenImage={openImagePicker}
               comparing={showingBefore}
               onCanvasReady={handleCanvasReady}

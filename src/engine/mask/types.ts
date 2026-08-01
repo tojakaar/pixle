@@ -63,32 +63,36 @@ export function findMaskByLabel(
 }
 
 /**
- * Labels Gemini may request today. Unknown / unsupported labels fall back to
- * a global edit — the renderer is never blocked by a missing mask.
+ * Labels Gemini may request. Unknown / unsupported labels fall back to a
+ * global edit — the renderer is never blocked by a missing mask.
  *
- * Only `sky` has a real provider in this PR; the rest are reserved for expansion.
+ * High-quality implemented set (SegFormer): sky, person, vegetation, water,
+ * buildings, ground, background. Other names are accepted as aliases or
+ * reserved for future providers.
  */
 export const SEMANTIC_TARGET_LABELS = [
   "sky",
   "person",
+  "vegetation",
+  "water",
+  "buildings",
+  "ground",
+  "background",
   "face",
   "skin",
   "hair",
   "eyes",
   "clouds",
   "mountains",
-  "water",
   "trees",
   "grass",
   "road",
-  "buildings",
   "food",
   "cup",
   "flowers",
   "animals",
   "cars",
   "foreground",
-  "background",
 ] as const;
 
 export type SemanticTargetLabel = (typeof SEMANTIC_TARGET_LABELS)[number];

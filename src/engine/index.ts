@@ -83,22 +83,31 @@ export {
   shortenEditSummary,
 } from "./editSummary";
 export type {
+  ImplementedSemanticLabel,
   Mask,
   MaskBounds,
   MaskCollection,
   MaskProvider,
+  MaskProviderStatus,
   Segmenter,
   SegmenterKind,
   SemanticTargetLabel,
 } from "./mask";
 export {
+  IMPLEMENTED_SEMANTIC_LABELS,
   SEMANTIC_TARGET_LABELS,
   createDefaultSegmenter,
   createMaskProvider,
+  createSegformerSegmenter,
   createSkyHeuristicSegmenter,
   createStubSegmenter,
   emptyMaskCollection,
   findMaskByLabel,
+  isMaskDebugEnabled,
   isSemanticTargetLabel,
+  paintMaskDebugOverlay,
   resampleMask,
+  resolveSemanticLabel,
+  setMaskDebugEnabled,
+  toggleMaskDebugEnabled,
 } from "./mask";
