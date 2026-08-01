@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent } from "react";
 import { editFromPrompt } from "../aiEditor";
 import type { EditParameters, ImageAnalysis } from "../engine";
 
@@ -23,24 +23,50 @@ export function AiEditorPanel({
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [statusTone, setStatusTone] = useState<"ok" | "error">("ok");
+  const requestIdRef = useRef(0);
+  const paramsRef = useRef(params);
+  const analysisRef = useRef(imageAnalysis);
+
+  paramsRef.current = params;
+  analysisRef.current = imageAnalysis;
 
   const chatReady = Boolean(imageAnalysis) && !disabled;
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
     const trimmed = prompt.trim();
-    if (!trimmed || !chatReady || busy || !imageAnalysis) return;
+    const analysis = analysisRef.current;
+    if (!trimmed || !chatReady || busy || !analysis) return;
 
+    const requestId = ++requestIdRef.current;
     setBusy(true);
     setStatus(null);
 
     try {
-      const result = await editFromPrompt(trimmed, params, imageAnalysis);
-      onApply(result.parameters);
-      setPrompt("");
-      setStatusTone("ok");
-      setStatus(result.editSummary?.trim() || "Applied to sliders");
+      const result = await editFromPrompt(
+        trimmed,
+        paramsRef.current,
+        analysis,
+      );
+      if (requestId !== requestIdRef.current) return;
+
+      try {
+        onApply(result.parameters);
+        setPrompt("");
+        setStatusTone("ok");
+        setStatus(result.editSummary?.trim() || "Applied to sliders");
+      } catch (applyError) {
+        // Applying must never leave the panel stuck in Sending…
+        const message =
+          applyError instanceof Error && applyError.message.trim()
+            ? applyError.message
+            : "Could not apply that edit";
+        setStatusTone("error");
+        setStatus(message);
+      }
     } catch (error) {
+      if (requestId !== requestIdRef.current) return;
+
       const message =
         error instanceof Error && error.message.trim()
           ? error.message
@@ -48,7 +74,9 @@ export function AiEditorPanel({
       setStatusTone("error");
       setStatus(message);
     } finally {
-      setBusy(false);
+      if (requestId === requestIdRef.current) {
+        setBusy(false);
+      }
     }
   }
 

@@ -3,7 +3,10 @@ import { AiEditorPanel } from "./components/AiEditorPanel";
 import { EditPanel } from "./components/EditPanel";
 import { ImageToolbar } from "./components/ImageToolbar";
 import { ImageViewport } from "./components/ImageViewport";
-import { exportEditedImage } from "./exportFile";
+import {
+  chooseExportDestination,
+  writeExport,
+} from "./exportFile";
 import {
   BUILTIN_LOOKS,
   DEFAULT_EDIT_PARAMETERS,
@@ -39,6 +42,7 @@ interface LastEditSession {
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const openGenerationRef = useRef(0);
+  const exportingRef = useRef(false);
   const holdingBeforeRef = useRef(false);
   const presentRef = useRef<EditParameters>({ ...DEFAULT_EDIT_PARAMETERS });
   const [source, setSource] = useState<ImageData | null>(null);
@@ -61,6 +65,8 @@ function App() {
   const [customLooks, setCustomLooks] = useState<Look[]>(() =>
     loadSavedLooks(),
   );
+  /** Bumps after export/reset so in-flight AI panels drop stale busy state. */
+  const [editorSessionKey, setEditorSessionKey] = useState(0);
 
   const params = history.present;
   presentRef.current = params;
@@ -75,7 +81,7 @@ function App() {
 
   async function handleFileChange(fileList: FileList | null) {
     const file = fileList?.[0];
-    if (!file || opening) return;
+    if (!file || opening || exportingRef.current) return;
 
     const accepted =
       file.type === "image/jpeg" ||
@@ -94,6 +100,7 @@ function App() {
     setBeforeLatched(false);
     holdingBeforeRef.current = false;
     setLastEdit(null);
+    setEditorSessionKey((key) => key + 1);
 
     try {
       const decoded = await decodeImageFile(file);
@@ -110,6 +117,7 @@ function App() {
       setImageAnalysis(quickAnalysis);
       setFileName(file.name);
       setHistory(createEditHistory());
+      // Leave Opening as soon as pixels are shown; analysis continues below.
       setOpening(false);
       if (fileInputRef.current) {
         fileInputRef.current.value = "";
@@ -132,6 +140,10 @@ function App() {
     } catch {
       if (generation === openGenerationRef.current) {
         window.alert("Could not open that image.");
+      }
+    } finally {
+      // Safety net: never leave Opening stuck after a failed/cancelled open.
+      if (generation === openGenerationRef.current) {
         setOpening(false);
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
@@ -206,6 +218,9 @@ function App() {
     setShowingBefore(false);
     setBeforeLatched(false);
     holdingBeforeRef.current = false;
+    setExportStatus(null);
+    // Drop any in-flight AI busy/error UI tied to the previous edit session.
+    setEditorSessionKey((key) => key + 1);
   }
 
   function handleBeforePointerDown() {
@@ -255,17 +270,43 @@ function App() {
   }
 
   async function handleExport() {
-    if (!sourceFile || exporting || opening) return;
+    // Use a ref so a second click before re-render cannot start another export.
+    if (!sourceFile || exportingRef.current || opening) return;
 
-    setExporting(true);
+    const exportOptions = {
+      sourceFile,
+      params: { ...presentRef.current },
+      originalFileName: fileName,
+    };
+
     setExportStatus(null);
 
+    let destination;
     try {
-      const result = await exportEditedImage({
-        sourceFile,
-        params,
-        originalFileName: fileName,
-      });
+      // Keep the UI interactive while the native save dialog is open. Disabling
+      // controls for the dialog itself left the app unclickable after cancel /
+      // save on some Tauri webviews (stuck disabled + lost focus/pointer).
+      destination = await chooseExportDestination(exportOptions);
+    } catch (error) {
+      const message =
+        error instanceof Error && error.message.trim()
+          ? error.message
+          : "Could not open the save dialog.";
+      setExportTone("error");
+      setExportStatus(message);
+      return;
+    }
+
+    if (destination.status === "cancelled") {
+      setExportStatus(null);
+      return;
+    }
+
+    exportingRef.current = true;
+    setExporting(true);
+
+    try {
+      const result = await writeExport(exportOptions, destination);
 
       if (result.status === "cancelled") {
         setExportStatus(null);
@@ -283,7 +324,10 @@ function App() {
       setExportTone("error");
       setExportStatus(message);
     } finally {
+      exportingRef.current = false;
       setExporting(false);
+      // Ensure Ask pixle is remounted interactive after the export path.
+      setEditorSessionKey((key) => key + 1);
     }
   }
 
@@ -400,6 +444,7 @@ function App() {
             comparing={showingBefore}
           />
           <AiEditorPanel
+            key={editorSessionKey}
             params={params}
             imageAnalysis={imageAnalysis}
             disabled={controlsDisabled}

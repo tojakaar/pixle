@@ -1,3 +1,5 @@
+import { useRef } from "react";
+
 interface ImageToolbarProps {
   disabled: boolean;
   canUndo: boolean;
@@ -26,6 +28,28 @@ export function ImageToolbar({
   onBeforePointerUp,
   onToggleBefore,
 }: ImageToolbarProps) {
+  const pressStartedRef = useRef<number | null>(null);
+  const captureIdRef = useRef<number | null>(null);
+
+  function releaseBeforeCapture(target: HTMLButtonElement) {
+    const pointerId = captureIdRef.current;
+    captureIdRef.current = null;
+    if (pointerId === null) return;
+    try {
+      if (target.hasPointerCapture(pointerId)) {
+        target.releasePointerCapture(pointerId);
+      }
+    } catch {
+      // Capture may already be released by the browser.
+    }
+  }
+
+  function finishBeforePress(target: HTMLButtonElement, durationMs: number) {
+    pressStartedRef.current = null;
+    releaseBeforeCapture(target);
+    onBeforePointerUp(durationMs);
+  }
+
   return (
     <div className="image-toolbar" role="toolbar" aria-label="Image edit controls">
       <button
@@ -40,20 +64,35 @@ export function ImageToolbar({
         title="Hold to peek at the original, or click to toggle"
         onPointerDown={(e) => {
           if (disabled || e.button !== 0) return;
-          e.currentTarget.setPointerCapture(e.pointerId);
-          (e.currentTarget as HTMLButtonElement).dataset.pressStarted =
-            String(performance.now());
+          const target = e.currentTarget;
+          pressStartedRef.current = performance.now();
+          captureIdRef.current = e.pointerId;
+          try {
+            target.setPointerCapture(e.pointerId);
+          } catch {
+            captureIdRef.current = null;
+          }
           onBeforePointerDown();
         }}
         onPointerUp={(e) => {
           if (e.button !== 0) return;
-          const started = Number(
-            (e.currentTarget as HTMLButtonElement).dataset.pressStarted ?? "0",
-          );
-          const durationMs = performance.now() - started;
-          onBeforePointerUp(durationMs);
+          const started = pressStartedRef.current;
+          if (started === null) return;
+          finishBeforePress(e.currentTarget, performance.now() - started);
         }}
-        onPointerCancel={() => onBeforePointerUp(0)}
+        onPointerCancel={(e) => {
+          if (pressStartedRef.current === null) return;
+          finishBeforePress(e.currentTarget, 0);
+        }}
+        onLostPointerCapture={() => {
+          // If capture is lost while a press is active (e.g. button became
+          // disabled during a native dialog), still clear before/after state
+          // so pointer events are not swallowed by a dead capture target.
+          if (pressStartedRef.current === null) return;
+          pressStartedRef.current = null;
+          captureIdRef.current = null;
+          onBeforePointerUp(0);
+        }}
         onKeyDown={(e) => {
           if (disabled) return;
           if (e.key === " " || e.key === "Enter") {
