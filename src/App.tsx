@@ -14,6 +14,7 @@ import {
   analyzeImageSync,
   canRedo,
   canUndo,
+  cloneEditParameters,
   commitEdit,
   createEditHistory,
   decodeImageFile,
@@ -44,7 +45,9 @@ function App() {
   const openGenerationRef = useRef(0);
   const exportingRef = useRef(false);
   const holdingBeforeRef = useRef(false);
-  const presentRef = useRef<EditParameters>({ ...DEFAULT_EDIT_PARAMETERS });
+  const presentRef = useRef<EditParameters>(
+    cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
+  );
   const [source, setSource] = useState<ImageData | null>(null);
   /** Original file kept for full-resolution export (never mutated). */
   const [sourceFile, setSourceFile] = useState<File | null>(null);
@@ -163,8 +166,8 @@ function App() {
     if (parametersEqual(before, next)) return;
 
     setLastEdit({
-      before: { ...before },
-      after: { ...next },
+      before: cloneEditParameters(before),
+      after: cloneEditParameters(next),
       intensity: 100,
     });
     setHistory((prev) => commitEdit(prev, next));
@@ -181,7 +184,7 @@ function App() {
   ) {
     setHistory((prev) => ({
       ...prev,
-      present: { ...next },
+      present: cloneEditParameters(next),
       // Live slider changes discard redo — present has diverged.
       future: [],
     }));
@@ -254,7 +257,7 @@ function App() {
   }
 
   function handleApplyLook(look: Look) {
-    applyCommittedEdit({ ...look.parameters });
+    applyCommittedEdit(cloneEditParameters(look.parameters));
   }
 
   function handleSaveLook() {
@@ -275,7 +278,7 @@ function App() {
 
     const exportOptions = {
       sourceFile,
-      params: { ...presentRef.current },
+      params: cloneEditParameters(presentRef.current),
       originalFileName: fileName,
     };
 

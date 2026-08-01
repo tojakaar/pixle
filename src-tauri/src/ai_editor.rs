@@ -1,9 +1,32 @@
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+
+/// Per-colour HSL band — mirrors frontend `HslBand`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HslBand {
+    pub hue: f64,
+    pub saturation: f64,
+    pub luminance: f64,
+}
+
+/// Nested HSL adjustments for eight overlapping hue bands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HslAdjustments {
+    pub red: HslBand,
+    pub orange: HslBand,
+    pub yellow: HslBand,
+    pub green: HslBand,
+    pub aqua: HslBand,
+    pub blue: HslBand,
+    pub purple: HslBand,
+    pub magenta: HslBand,
+}
 
 /// Mirrors the frontend `EditParameters` object. The model may only return these
-/// numeric fields — never image data.
+/// fields — never image data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditParameters {
@@ -11,9 +34,25 @@ pub struct EditParameters {
     pub contrast: f64,
     pub highlights: f64,
     pub shadows: f64,
+    pub whites: f64,
+    pub blacks: f64,
+    pub fade: f64,
     pub temperature: f64,
     pub tint: f64,
     pub saturation: f64,
+    pub vibrance: f64,
+    pub grain_amount: f64,
+    pub grain_size: f64,
+    pub grain_roughness: f64,
+    pub grain_color: f64,
+    pub clarity: f64,
+    pub sharpening: f64,
+    pub luminance_noise_reduction: f64,
+    pub chroma_noise_reduction: f64,
+    pub vignette_amount: f64,
+    pub vignette_midpoint: f64,
+    pub vignette_feather: f64,
+    pub hsl: HslAdjustments,
 }
 
 /// Compact local image-analysis metadata from the frontend.
@@ -106,8 +145,9 @@ enum LlmProvider {
     Anthropic,
 }
 
-const SYSTEM_PROMPT: &str = r#"You are an experienced professional Adobe Lightroom photo editor working inside Pixle.
+const SYSTEM_PROMPT: &str = r#"You are an experienced professional photo editor working inside Pixle.
 You think in photographic intent, not keyword matching. You never modify, generate, describe as binary, or return image pixels.
+You never expose chain-of-thought. Return structured EditParameters JSON only.
 
 You receive:
 1. ImageAnalysis — local metadata (histogram, colour temperature, dominant colours, highlight/shadow clipping, dimensions, faces when available). Use it as your light-table read of the file.
@@ -117,29 +157,73 @@ You receive:
 Return one JSON object only (no markdown, no commentary outside JSON).
 
 ## Output schema
-Required numeric EditParameters (include every key exactly once):
+Include every key exactly once.
+
+Basic tone:
 - exposure: -2 to 2 (EV stops)
 - contrast: -100 to 100
-- highlights: -100 to 100 (negative recovers/protects bright areas)
+- highlights: -100 to 100 (negative recovers/protects bright areas / highlight rolloff)
 - shadows: -100 to 100 (positive opens shadow detail)
+- whites: -100 to 100 (extreme highlight tip)
+- blacks: -100 to 100 (extreme shadow tip; negative crushes, positive lifts)
+- fade: 0 to 100 (lifted blacks / faded film)
+
+Global colour:
 - temperature: -100 to 100 (negative cooler / blue; positive warmer / amber)
 - tint: -100 to 100 (negative green; positive magenta)
-- saturation: -100 to 100
+- saturation: -100 to 100 (linear global saturation — affects all colours evenly)
+- vibrance: -100 to 100 (smart saturation — boosts muted colours, protects already-saturated colours and skin)
+
+Film texture:
+- grainAmount: 0 to 100
+- grainSize: 0 to 100 (low = fine grain; high = coarse grain)
+- grainRoughness: 0 to 100 (soft ↔ crunchy)
+- grainColor: 0 to 100 (0 = monochrome grain; 100 = coloured grain)
+
+Detail:
+- clarity: -100 to 100 (midtone local contrast)
+- sharpening: 0 to 100
+- luminanceNoiseReduction: 0 to 100
+- chromaNoiseReduction: 0 to 100
+
+Vignette:
+- vignetteAmount: -100 to 100 (negative darkens edges)
+- vignetteMidpoint: 0 to 100
+- vignetteFeather: 0 to 100
+
+Per-colour HSL (overlapping soft hue bands — no hard boundaries):
+- hsl: object with keys red, orange, yellow, green, aqua, blue, purple, magenta
+- each colour object must include: hue (-100…100), saturation (-100…100), luminance (-100…100)
+
+Examples of intent → parameters:
+- "make the blues lighter" → raise hsl.blue.luminance
+- "mute the greens" → lower hsl.green.saturation (and maybe green luminance slightly)
+- "shift reds slightly toward orange" → small positive hsl.red.hue
+- "desaturate yellows" → negative hsl.yellow.saturation
+- "make skin slightly brighter" → raise hsl.orange.luminance (and mild red luminance); keep vibrance/saturation restrained
+- "fine grain" → grainAmount moderate, grainSize low, grainRoughness moderate, grainColor near 0
+- "coarse grain" → higher grainSize / roughness
+- "monochrome grain" → grainColor 0
+- "faded film" → raise fade, lift blacks/shadows, ease contrast, often lower saturation
+- "muted colours" → negative vibrance and/or saturation; selective HSL saturation cuts
+- "lifted blacks" → positive fade and/or positive blacks
+- "highlight rolloff" → negative highlights (and often negative whites)
+- "vibrance" vs "saturation": vibrance for lively but natural colour; saturation for even global chroma push/pull
 
 Optional:
-- edit_summary: a short plain-language note (one sentence, ≤120 characters) explaining the intended adjustment. This is explanatory only — it is never applied to pixels.
+- edit_summary: a short plain-language note (one sentence, ≤120 characters). Explanatory only — never applied to pixels.
 
-Do not return any other keys (no image data, histograms, analysis fields, or presets).
+Do not return any other keys (no image data, histograms, analysis fields, presets, or reasoning fields).
 
 ## Editing principles
 - Read the request as photographic intent (mood, story, print goal), not literal keywords.
-- Always consult ImageAnalysis before deciding. Examples: high highlightClippingPercent → pull highlights / ease exposure; high shadowClippingPercent → lift shadows carefully; warm/cool Kelvin and colourTemperatureLabel → inform temperature/tint; dominantColours → guide saturation and white balance; faces present → protect natural skin tones.
-- Make coordinated multi-parameter moves. Exposure, contrast, highlights, shadows, temperature, tint, and saturation interact — change them as a set, not in isolation.
+- Always consult ImageAnalysis before deciding.
+- Make coordinated multi-parameter moves; parameters interact.
 - Prefer moderate, printable adjustments unless the user asks for a strong look or a reset.
-- Avoid clipping highlights further; when already clipped, prioritise recovery.
-- Avoid crushing shadow detail; keep texture in the lows unless a crushed-black look is clearly requested.
-- When faces are detected (or the request is a portrait): keep skin believable — restrain saturation and extreme temperature/tint swings; bias toward a natural portrait balance.
-- Style directions are aesthetic goals, not fixed presets. Translate them into tasteful parameter combinations informed by this specific image's analysis. Supported directions include (non-exhaustive): cinematic, film look, documentary, moody, warm sunset, editorial, natural portrait, vintage.
+- Avoid clipping highlights further; when already clipped, prioritise recovery (negative highlights/whites).
+- Avoid crushing shadow detail unless clearly requested.
+- When faces are detected (or the request is a portrait): keep skin believable — prefer vibrance over saturation, use orange/red HSL carefully, restrain extreme temperature/tint.
+- Style directions (cinematic, film look, documentary, moody, warm sunset, editorial, natural portrait, vintage, faded summer, cool editorial) are aesthetic goals — translate into tasteful parameter combinations for this specific image.
 - If the instruction is unrelated to photo editing, return the current parameters unchanged (edit_summary may say so).
 "#;
 
@@ -395,7 +479,7 @@ async fn call_anthropic(user_message: &str) -> Result<String, String> {
 
     let body = json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": 2048,
         "temperature": 0.2,
         "system": SYSTEM_PROMPT,
         "messages": [
@@ -477,6 +561,91 @@ fn extract_json_object(content: &str) -> Result<String, String> {
     ))
 }
 
+const SCALAR_KEYS: [&str; 22] = [
+    "exposure",
+    "contrast",
+    "highlights",
+    "shadows",
+    "whites",
+    "blacks",
+    "fade",
+    "temperature",
+    "tint",
+    "saturation",
+    "vibrance",
+    "grainAmount",
+    "grainSize",
+    "grainRoughness",
+    "grainColor",
+    "clarity",
+    "sharpening",
+    "luminanceNoiseReduction",
+    "chromaNoiseReduction",
+    "vignetteAmount",
+    "vignetteMidpoint",
+    "vignetteFeather",
+];
+
+const HSL_COLORS: [&str; 8] = [
+    "red", "orange", "yellow", "green", "aqua", "blue", "purple", "magenta",
+];
+
+const HSL_CHANNELS: [&str; 3] = ["hue", "saturation", "luminance"];
+
+fn parse_hsl_band(obj: &Map<String, Value>, color: &str) -> Result<HslBand, String> {
+    let value = obj
+        .get(color)
+        .ok_or_else(|| format!("Missing required field `hsl.{color}`."))?;
+    let band = value
+        .as_object()
+        .ok_or_else(|| format!("Field `hsl.{color}` must be an object."))?;
+
+    for channel in HSL_CHANNELS {
+        if !band.contains_key(channel) {
+            return Err(format!("Missing required field `hsl.{color}.{channel}`."));
+        }
+    }
+    for key in band.keys() {
+        if !HSL_CHANNELS.contains(&key.as_str()) {
+            return Err(format!("Unexpected field `hsl.{color}.{key}`."));
+        }
+    }
+
+    Ok(HslBand {
+        hue: read_number(band, "hue", -100.0, 100.0)?,
+        saturation: read_number(band, "saturation", -100.0, 100.0)?,
+        luminance: read_number(band, "luminance", -100.0, 100.0)?,
+    })
+}
+
+fn parse_hsl(value: &Value) -> Result<HslAdjustments, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "Field `hsl` must be an object.".to_string())?;
+
+    for color in HSL_COLORS {
+        if !obj.contains_key(color) {
+            return Err(format!("Missing required field `hsl.{color}`."));
+        }
+    }
+    for key in obj.keys() {
+        if !HSL_COLORS.contains(&key.as_str()) {
+            return Err(format!("Unexpected field `hsl.{key}`."));
+        }
+    }
+
+    Ok(HslAdjustments {
+        red: parse_hsl_band(obj, "red")?,
+        orange: parse_hsl_band(obj, "orange")?,
+        yellow: parse_hsl_band(obj, "yellow")?,
+        green: parse_hsl_band(obj, "green")?,
+        aqua: parse_hsl_band(obj, "aqua")?,
+        blue: parse_hsl_band(obj, "blue")?,
+        purple: parse_hsl_band(obj, "purple")?,
+        magenta: parse_hsl_band(obj, "magenta")?,
+    })
+}
+
 fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
     let obj = value
         .as_object()
@@ -484,25 +653,21 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
 
     // Reject unexpected payload shapes (e.g. image blobs) before applying.
     // `edit_summary` is the only optional non-parameter field allowed.
-    const REQUIRED: [&str; 7] = [
-        "exposure",
-        "contrast",
-        "highlights",
-        "shadows",
-        "temperature",
-        "tint",
-        "saturation",
-    ];
     const OPTIONAL: [&str; 1] = ["edit_summary"];
 
-    for key in REQUIRED {
+    for key in SCALAR_KEYS {
         if !obj.contains_key(key) {
             return Err(format!("Missing required field `{key}`."));
         }
     }
+    if !obj.contains_key("hsl") {
+        return Err("Missing required field `hsl`.".to_string());
+    }
 
     for key in obj.keys() {
-        let allowed = REQUIRED.contains(&key.as_str()) || OPTIONAL.contains(&key.as_str());
+        let allowed = SCALAR_KEYS.contains(&key.as_str())
+            || key == "hsl"
+            || OPTIONAL.contains(&key.as_str());
         if !allowed {
             return Err(format!("Unexpected field `{key}` in EditParameters."));
         }
@@ -526,15 +691,33 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
         }
     };
 
+    let hsl = parse_hsl(obj.get("hsl").unwrap())?;
+
     Ok(EditFromPromptResult {
         parameters: EditParameters {
             exposure: read_number(obj, "exposure", -2.0, 2.0)?,
             contrast: read_number(obj, "contrast", -100.0, 100.0)?,
             highlights: read_number(obj, "highlights", -100.0, 100.0)?,
             shadows: read_number(obj, "shadows", -100.0, 100.0)?,
+            whites: read_number(obj, "whites", -100.0, 100.0)?,
+            blacks: read_number(obj, "blacks", -100.0, 100.0)?,
+            fade: read_number(obj, "fade", 0.0, 100.0)?,
             temperature: read_number(obj, "temperature", -100.0, 100.0)?,
             tint: read_number(obj, "tint", -100.0, 100.0)?,
             saturation: read_number(obj, "saturation", -100.0, 100.0)?,
+            vibrance: read_number(obj, "vibrance", -100.0, 100.0)?,
+            grain_amount: read_number(obj, "grainAmount", 0.0, 100.0)?,
+            grain_size: read_number(obj, "grainSize", 0.0, 100.0)?,
+            grain_roughness: read_number(obj, "grainRoughness", 0.0, 100.0)?,
+            grain_color: read_number(obj, "grainColor", 0.0, 100.0)?,
+            clarity: read_number(obj, "clarity", -100.0, 100.0)?,
+            sharpening: read_number(obj, "sharpening", 0.0, 100.0)?,
+            luminance_noise_reduction: read_number(obj, "luminanceNoiseReduction", 0.0, 100.0)?,
+            chroma_noise_reduction: read_number(obj, "chromaNoiseReduction", 0.0, 100.0)?,
+            vignette_amount: read_number(obj, "vignetteAmount", -100.0, 100.0)?,
+            vignette_midpoint: read_number(obj, "vignetteMidpoint", 0.0, 100.0)?,
+            vignette_feather: read_number(obj, "vignetteFeather", 0.0, 100.0)?,
+            hsl,
         },
         edit_summary,
     })
@@ -581,6 +764,44 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn sample_full_params() -> Value {
+        let band = json!({ "hue": 0, "saturation": 0, "luminance": 0 });
+        json!({
+            "exposure": 0.0,
+            "contrast": 0.0,
+            "highlights": 0.0,
+            "shadows": 0.0,
+            "whites": 0.0,
+            "blacks": 0.0,
+            "fade": 0.0,
+            "temperature": 0.0,
+            "tint": 0.0,
+            "saturation": 0.0,
+            "vibrance": 0.0,
+            "grainAmount": 0.0,
+            "grainSize": 40.0,
+            "grainRoughness": 35.0,
+            "grainColor": 0.0,
+            "clarity": 0.0,
+            "sharpening": 0.0,
+            "luminanceNoiseReduction": 0.0,
+            "chromaNoiseReduction": 0.0,
+            "vignetteAmount": 0.0,
+            "vignetteMidpoint": 50.0,
+            "vignetteFeather": 50.0,
+            "hsl": {
+                "red": band,
+                "orange": band,
+                "yellow": band,
+                "green": band,
+                "aqua": band,
+                "blue": band,
+                "purple": band,
+                "magenta": band
+            }
+        })
+    }
+
     fn sample_analysis() -> ImageAnalysis {
         ImageAnalysis {
             width: 100,
@@ -604,33 +825,41 @@ mod tests {
 
     #[test]
     fn accepts_valid_parameters() {
-        let value = json!({
-            "exposure": 0.4,
-            "contrast": 25,
-            "highlights": -30,
-            "shadows": 10,
-            "temperature": 20,
-            "tint": -5,
-            "saturation": 15
-        });
+        let mut value = sample_full_params();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("exposure".into(), json!(0.4));
+        obj.insert("contrast".into(), json!(25));
+        obj.insert("highlights".into(), json!(-30));
+        obj.insert("shadows".into(), json!(10));
+        obj.insert("vibrance".into(), json!(15));
+        obj.insert("grainAmount".into(), json!(20));
+        obj.insert("fade".into(), json!(8));
+        let hsl = obj.get_mut("hsl").unwrap().as_object_mut().unwrap();
+        hsl.insert(
+            "blue".into(),
+            json!({ "hue": 0, "saturation": -12, "luminance": 9 }),
+        );
+
         let parsed = parse_edit_response(&value).unwrap();
         assert_eq!(parsed.parameters.exposure, 0.4);
         assert_eq!(parsed.parameters.highlights, -30.0);
+        assert_eq!(parsed.parameters.vibrance, 15.0);
+        assert_eq!(parsed.parameters.grain_amount, 20.0);
+        assert_eq!(parsed.parameters.fade, 8.0);
+        assert_eq!(parsed.parameters.hsl.blue.saturation, -12.0);
+        assert_eq!(parsed.parameters.hsl.blue.luminance, 9.0);
         assert!(parsed.edit_summary.is_none());
     }
 
     #[test]
     fn accepts_optional_edit_summary() {
-        let value = json!({
-            "exposure": 0.2,
-            "contrast": 10,
-            "highlights": -20,
-            "shadows": 15,
-            "temperature": 12,
-            "tint": 0,
-            "saturation": -5,
-            "edit_summary": "  Warm cinematic grade; protected highlights.  "
-        });
+        let mut value = sample_full_params();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("exposure".into(), json!(0.2));
+        obj.insert(
+            "edit_summary".into(),
+            json!("  Warm cinematic grade; protected highlights.  "),
+        );
         let parsed = parse_edit_response(&value).unwrap();
         assert_eq!(parsed.parameters.exposure, 0.2);
         assert_eq!(
@@ -641,32 +870,22 @@ mod tests {
 
     #[test]
     fn rejects_non_string_edit_summary() {
-        let value = json!({
-            "exposure": 0.0,
-            "contrast": 0.0,
-            "highlights": 0.0,
-            "shadows": 0.0,
-            "temperature": 0.0,
-            "tint": 0.0,
-            "saturation": 0.0,
-            "edit_summary": 123
-        });
+        let mut value = sample_full_params();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("edit_summary".into(), json!(123));
         let err = parse_edit_response(&value).unwrap_err();
         assert!(err.contains("edit_summary"));
     }
 
     #[test]
     fn rejects_unexpected_fields() {
-        let value = json!({
-            "exposure": 0.0,
-            "contrast": 0.0,
-            "highlights": 0.0,
-            "shadows": 0.0,
-            "temperature": 0.0,
-            "tint": 0.0,
-            "saturation": 0.0,
-            "imageBase64": "abc"
-        });
+        let mut value = sample_full_params();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("imageBase64".into(), json!("abc"));
         let err = parse_edit_response(&value).unwrap_err();
         assert!(err.contains("Unexpected field"));
     }
@@ -683,33 +902,26 @@ mod tests {
 
     #[test]
     fn rejects_non_numeric_fields() {
-        let value = json!({
-            "exposure": "bright",
-            "contrast": 0.0,
-            "highlights": 0.0,
-            "shadows": 0.0,
-            "temperature": 0.0,
-            "tint": 0.0,
-            "saturation": 0.0
-        });
+        let mut value = sample_full_params();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("exposure".into(), json!("bright"));
         let err = parse_edit_response(&value).unwrap_err();
         assert!(err.contains("must be a number"));
     }
 
     #[test]
     fn clamps_out_of_range_values() {
-        let value = json!({
-            "exposure": 9.0,
-            "contrast": -500,
-            "highlights": 0,
-            "shadows": 0,
-            "temperature": 0,
-            "tint": 0,
-            "saturation": 0
-        });
+        let mut value = sample_full_params();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("exposure".into(), json!(9.0));
+        obj.insert("contrast".into(), json!(-500));
+        obj.insert("fade".into(), json!(200));
         let parsed = parse_edit_response(&value).unwrap();
         assert_eq!(parsed.parameters.exposure, 2.0);
         assert_eq!(parsed.parameters.contrast, -100.0);
+        assert_eq!(parsed.parameters.fade, 100.0);
     }
 
     #[test]
@@ -729,15 +941,7 @@ mod tests {
             return;
         }
 
-        let current = EditParameters {
-            exposure: 0.0,
-            contrast: 0.0,
-            highlights: 0.0,
-            shadows: 0.0,
-            temperature: 0.0,
-            tint: 0.0,
-            saturation: 0.0,
-        };
+        let current: EditParameters = serde_json::from_value(sample_full_params()).unwrap();
         let next = edit_from_prompt("make it brighter".into(), current, sample_analysis())
             .await
             .expect("live AI edit should succeed");

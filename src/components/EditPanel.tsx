@@ -1,8 +1,9 @@
 import {
   DEFAULT_EDIT_PARAMETERS,
   EDIT_SLIDER_CONFIG,
-  type EditParameterKey,
+  cloneEditParameters,
   type EditParameters,
+  type ScalarEditParameterKey,
 } from "../engine";
 import type { ParameterChange } from "../engine/editDiff";
 import type { Look } from "../engine/looks";
@@ -27,17 +28,25 @@ interface EditPanelProps {
   onApplyLook: (look: Look) => void;
 }
 
-const SLIDER_ORDER: EditParameterKey[] = [
+/**
+ * Curated Adjust sliders — keep the panel light.
+ * Grain, HSL, vignette, and detail arrive via Ask pixle / Looks.
+ */
+const SLIDER_ORDER: ScalarEditParameterKey[] = [
   "exposure",
   "contrast",
   "highlights",
   "shadows",
+  "whites",
+  "blacks",
+  "fade",
   "temperature",
   "tint",
+  "vibrance",
   "saturation",
 ];
 
-function formatValue(key: EditParameterKey, value: number): string {
+function formatValue(key: ScalarEditParameterKey, value: number): string {
   if (key === "exposure") {
     return value.toFixed(2);
   }
@@ -58,8 +67,8 @@ export function EditPanel({
   onSaveLook,
   onApplyLook,
 }: EditPanelProps) {
-  function update(key: EditParameterKey, value: number) {
-    onChange({ ...params, [key]: value });
+  function update(key: ScalarEditParameterKey, value: number) {
+    onChange({ ...params, hsl: params.hsl, [key]: value });
   }
 
   return (
@@ -90,7 +99,9 @@ export function EditPanel({
           className="edit-panel__reset"
           disabled={disabled}
           onClick={() =>
-            onReset ? onReset() : onChange({ ...DEFAULT_EDIT_PARAMETERS })
+            onReset
+              ? onReset()
+              : onChange(cloneEditParameters(DEFAULT_EDIT_PARAMETERS))
           }
         >
           Reset

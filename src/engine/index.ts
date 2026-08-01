@@ -1,7 +1,24 @@
-export type { EditParameters, EditParameterKey } from "./EditParameters";
+export type {
+  EditParameters,
+  EditParameterKey,
+  ScalarEditParameterKey,
+  HslBand,
+  HslColorName,
+  HslAdjustments,
+} from "./EditParameters";
 export {
   DEFAULT_EDIT_PARAMETERS,
+  DEFAULT_HSL_BAND,
   EDIT_SLIDER_CONFIG,
+  HSL_BAND_SLIDER_CONFIG,
+  HSL_COLOR_NAMES,
+  SCALAR_EDIT_KEYS,
+  clampHslChannel,
+  clampScalarParam,
+  cloneEditParameters,
+  createDefaultHsl,
+  hslColorLabel,
+  normalizeEditParameters,
 } from "./EditParameters";
 export { applyEdits, isIdentityEdit } from "./render";
 export type {
