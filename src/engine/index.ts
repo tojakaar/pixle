@@ -56,5 +56,7 @@ export {
   diffParameters,
   lerpParameters,
 } from "./editDiff";
+export type { ChangeGroup } from "./changeGroups";
+export { groupParameterChanges } from "./changeGroups";
 export type { Look } from "./looks";
 export { BUILTIN_LOOKS } from "./looks";

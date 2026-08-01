@@ -531,6 +531,19 @@ async fn read_success_body(response: reqwest::Response) -> Result<String, String
         .map_err(|e| format!("Failed to read API response: {e}"))?;
 
     if !status.is_success() {
+        // Friendly copy for transient Gemini/provider overload — keep raw body in logs only.
+        if status.as_u16() == 503
+            || response_text.to_ascii_uppercase().contains("UNAVAILABLE")
+        {
+            eprintln!(
+                "[pixle ai] provider unavailable ({status}): {}",
+                truncate_for_error(&response_text)
+            );
+            return Err(
+                "Gemini is temporarily busy. Please try again in a moment.".to_string(),
+            );
+        }
+
         return Err(format!(
             "API returned {status}: {}",
             truncate_for_error(&response_text)

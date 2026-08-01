@@ -168,11 +168,32 @@ export function parseEditParameters(value: unknown): EditParameters {
   return parseEditResponse(value).parameters;
 }
 
+const GEMINI_BUSY_MESSAGE =
+  "Gemini is temporarily busy. Please try again in a moment.";
+
+/** Map provider overload / 503 payloads to a short UI-safe message. */
+function isProviderUnavailable(message: string): boolean {
+  const upper = message.toUpperCase();
+  return (
+    upper.includes("503") ||
+    upper.includes("UNAVAILABLE") ||
+    upper.includes("TEMPORARILY BUSY")
+  );
+}
+
 function formatInvokeError(error: unknown): string {
   if (typeof error === "string" && error.trim()) {
+    if (isProviderUnavailable(error)) {
+      console.warn("[pixle ai] provider unavailable:", error);
+      return GEMINI_BUSY_MESSAGE;
+    }
     return error;
   }
   if (error instanceof Error && error.message.trim()) {
+    if (isProviderUnavailable(error.message)) {
+      console.warn("[pixle ai] provider unavailable:", error.message);
+      return GEMINI_BUSY_MESSAGE;
+    }
     return error.message;
   }
   return "AI edit request failed.";

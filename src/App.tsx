@@ -1,8 +1,8 @@
 import { useDeferredValue, useEffect, useRef, useState } from "react";
 import { AiEditorPanel } from "./components/AiEditorPanel";
-import { EditPanel } from "./components/EditPanel";
 import { ImageToolbar } from "./components/ImageToolbar";
 import { ImageViewport } from "./components/ImageViewport";
+import { RightSidebar } from "./components/RightSidebar";
 import {
   chooseExportDestination,
   writeExport,
@@ -454,7 +454,7 @@ function App() {
             onApply={applyCommittedEdit}
           />
         </div>
-        <EditPanel
+        <RightSidebar
           params={params}
           disabled={controlsDisabled}
           onChange={setParamsLive}
