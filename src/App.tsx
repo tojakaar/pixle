@@ -1,4 +1,5 @@
-import { useDeferredValue, useEffect, useRef, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import type { EditFromPromptResult } from "./aiEditor";
 import { AiEditorPanel } from "./components/AiEditorPanel";
 import { ImageToolbar } from "./components/ImageToolbar";
 import { ImageViewport } from "./components/ImageViewport";
@@ -15,21 +16,31 @@ import {
   analyzeImageSync,
   canRedo,
   canUndo,
+  cloneEditDocument,
   cloneEditParameters,
   commitEdit,
+  createDefaultSegmenter,
   createEditHistory,
+  createGlobalEditDocument,
+  createLocalEditDocument,
+  createMaskProvider,
   decodeImageFile,
   diffParameters,
+  documentGlobalParameters,
+  editDocumentsEqual,
   lerpParameters,
   parametersEqual,
   redoEdit,
   resetEdit,
   undoEdit,
   yieldToUi,
+  type ApplyEditsOptions,
+  type EditDocument,
   type EditHistoryState,
   type EditParameters,
   type ImageAnalysis,
   type Look,
+  type Mask,
   type PreviewSizeHint,
 } from "./engine";
 import { isAbortError, openLog } from "./engine/openLog";
@@ -56,15 +67,13 @@ function App() {
   const placeholderUrlRef = useRef<string | null>(null);
   /** URLs waiting to be revoked after React commits a newer placeholder. */
   const urlsPendingRevokeRef = useRef<string[]>([]);
-  const presentRef = useRef<EditParameters>(
-    cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
-  );
-  /** Parameter snapshot last marked clean (open / successful export). */
-  const cleanParamsRef = useRef<EditParameters>(
-    cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
-  );
+  const presentRef = useRef<EditDocument>(createGlobalEditDocument());
+  /** Document snapshot last marked clean (open / successful export). */
+  const cleanDocRef = useRef<EditDocument>(createGlobalEditDocument());
   /** File waiting on the unsaved-changes dialog. */
   const pendingOpenFileRef = useRef<File | null>(null);
+  /** Swappable segmentation backend — renderer never depends on this. */
+  const maskProviderRef = useRef(createMaskProvider(createDefaultSegmenter()));
 
   /** Working preview buffer — set once per open; not recopied on slider moves. */
   const [source, setSource] = useState<ImageData | null>(null);
@@ -92,6 +101,12 @@ function App() {
   const [customLooks, setCustomLooks] = useState<Look[]>(() =>
     loadSavedLooks(),
   );
+  /** Resolved soft mask for the active semantic target (working-buffer res). */
+  const [activeMask, setActiveMask] = useState<Mask | null>(null);
+  /** Tracks async mask lookup so preview never flashes a wrong global grade. */
+  const [maskStatus, setMaskStatus] = useState<
+    "none" | "loading" | "ready" | "missing"
+  >("none");
   /** Bumps after export/reset so in-flight AI panels drop stale busy state. */
   const [editorSessionKey, setEditorSessionKey] = useState(0);
   const [unsavedDialogOpen, setUnsavedDialogOpen] = useState(false);
@@ -99,12 +114,34 @@ function App() {
   const [unsavedError, setUnsavedError] = useState<string | null>(null);
   const [isDirty, setIsDirty] = useState(false);
 
-  const params = history.present;
-  presentRef.current = params;
+  const editDoc = history.present;
+  const params = editDoc.parameters;
+  presentRef.current = editDoc;
   const previewParams = useDeferredValue(params);
+  // While a semantic mask is resolving, show the outside baseline so under-mask
+  // parameters are not briefly painted across the whole image.
   const displayParams = showingBefore
     ? DEFAULT_EDIT_PARAMETERS
-    : previewParams;
+    : editDoc.maskTarget && maskStatus === "loading"
+      ? (editDoc.baseParameters ?? DEFAULT_EDIT_PARAMETERS)
+      : previewParams;
+
+  const previewApplyOptions = useMemo<ApplyEditsOptions | undefined>(() => {
+    if (showingBefore || !activeMask || !editDoc.maskTarget) {
+      return undefined;
+    }
+    if (maskStatus !== "ready") return undefined;
+    return {
+      mask: activeMask,
+      baseParameters: editDoc.baseParameters ?? DEFAULT_EDIT_PARAMETERS,
+    };
+  }, [
+    showingBefore,
+    activeMask,
+    maskStatus,
+    editDoc.maskTarget,
+    editDoc.baseParameters,
+  ]);
 
   const changes = lastEdit
     ? diffParameters(lastEdit.before, lastEdit.after)
@@ -114,8 +151,8 @@ function App() {
     return requestId === openRequestIdRef.current;
   }
 
-  function markClean(snapshot: EditParameters = presentRef.current): void {
-    cleanParamsRef.current = cloneEditParameters(snapshot);
+  function markClean(snapshot: EditDocument = presentRef.current): void {
+    cleanDocRef.current = cloneEditDocument(snapshot);
     setIsDirty(false);
   }
 
@@ -127,8 +164,39 @@ function App() {
 
   // Keep dirty flag in sync with present vs last clean snapshot.
   useEffect(() => {
-    setIsDirty(!parametersEqual(params, cleanParamsRef.current));
-  }, [params]);
+    setIsDirty(!editDocumentsEqual(editDoc, cleanDocRef.current));
+  }, [editDoc]);
+
+  // Resolve / refresh the working-buffer mask whenever the semantic target changes.
+  // Failure or a missing object clears the mask — editing continues globally.
+  useEffect(() => {
+    const target = editDoc.maskTarget;
+    if (!target || !source) {
+      setActiveMask(null);
+      setMaskStatus("none");
+      return;
+    }
+
+    let cancelled = false;
+    setMaskStatus("loading");
+    void maskProviderRef.current
+      .findLabel(source, target)
+      .then((mask) => {
+        if (cancelled) return;
+        setActiveMask(mask);
+        setMaskStatus(mask ? "ready" : "missing");
+      })
+      .catch((error) => {
+        console.warn("[pixle mask] preview mask resolve failed", error);
+        if (cancelled) return;
+        setActiveMask(null);
+        setMaskStatus("missing");
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [editDoc.maskTarget, source, openRequestId]);
 
   // Revoke superseded object URLs only after React commits the new placeholder.
   // This effect runs post-commit, so the visible <img> already uses the new URL.
@@ -240,6 +308,9 @@ function App() {
     setImageAnalysis(null);
     setHistory(createEditHistory());
     setLastEdit(null);
+    setActiveMask(null);
+    setMaskStatus("none");
+    maskProviderRef.current.clearCache();
     setExportStatus(null);
     setPrepareError(null);
     setShowingBefore(false);
@@ -247,7 +318,7 @@ function App() {
     holdingBeforeRef.current = false;
     setEditorSessionKey((key) => key + 1);
     setPreparing(true);
-    markClean(DEFAULT_EDIT_PARAMETERS);
+    markClean(createGlobalEditDocument());
     endPlaceholder();
     openLog(requestId, "placeholder ready; preparing=true");
 
@@ -434,23 +505,89 @@ function App() {
     }
   }
 
-  /** Commit a new present state and bind intensity/changes to that edit. */
+  /** Commit a global (whole-image) edit and bind intensity/changes. */
   function applyCommittedEdit(next: EditParameters) {
-    const before = presentRef.current;
-    if (parametersEqual(before, next)) return;
+    const beforeDoc = presentRef.current;
+    const beforeParams = beforeDoc.parameters;
+    if (
+      !beforeDoc.maskTarget &&
+      parametersEqual(beforeParams, next)
+    ) {
+      return;
+    }
 
     setLastEdit({
-      before: cloneEditParameters(before),
+      before: cloneEditParameters(beforeParams),
       after: cloneEditParameters(next),
       intensity: 100,
     });
-    setHistory((prev) => commitEdit(prev, next));
+    setHistory((prev) =>
+      commitEdit(prev, createGlobalEditDocument(next)),
+    );
+  }
+
+  /**
+   * Apply an AI result. When Gemini names a supported target and the Segmenter
+   * finds a mask, parameters apply only under that mask. Otherwise behave as
+   * today's global edit — never block on missing segmentation.
+   */
+  async function applyAiEdit(result: EditFromPromptResult): Promise<void> {
+    const beforeDoc = presentRef.current;
+    const nextParams = result.parameters;
+    const target = result.target;
+
+    if (target && source) {
+      try {
+        const mask = await maskProviderRef.current.findLabel(source, target);
+        if (mask) {
+          const baseParameters =
+            beforeDoc.maskTarget === target && beforeDoc.baseParameters
+              ? beforeDoc.baseParameters
+              : documentGlobalParameters(beforeDoc);
+          const intensityBefore =
+            beforeDoc.maskTarget === target
+              ? beforeDoc.parameters
+              : baseParameters;
+
+          if (
+            beforeDoc.maskTarget === target &&
+            parametersEqual(beforeDoc.parameters, nextParams) &&
+            beforeDoc.baseParameters &&
+            parametersEqual(beforeDoc.baseParameters, baseParameters)
+          ) {
+            return;
+          }
+
+          setActiveMask(mask);
+          setLastEdit({
+            before: cloneEditParameters(intensityBefore),
+            after: cloneEditParameters(nextParams),
+            intensity: 100,
+          });
+          setHistory((prev) =>
+            commitEdit(
+              prev,
+              createLocalEditDocument(nextParams, target, baseParameters),
+            ),
+          );
+          return;
+        }
+      } catch (error) {
+        console.warn(
+          "[pixle mask] local edit fell back to global — segmenter error",
+          error,
+        );
+      }
+    }
+
+    applyCommittedEdit(nextParams);
   }
 
   /**
    * Live parameter updates without a history step.
    * Manual Adjust drags clear the last-edit session so Intensity/Changes
    * stay tied only to the most recent AI or look apply.
+   * Keeps an active semantic mask target so under-mask sliders still work.
    */
   function setParamsLive(
     next: EditParameters,
@@ -458,7 +595,10 @@ function App() {
   ) {
     setHistory((prev) => ({
       ...prev,
-      present: cloneEditParameters(next),
+      present: {
+        ...prev.present,
+        parameters: cloneEditParameters(next),
+      },
       // Live slider changes discard redo — present has diverged.
       future: [],
     }));
@@ -560,10 +700,17 @@ function App() {
       return { status: "cancelled" };
     }
 
+    const present = presentRef.current;
     const exportOptions = {
       sourceFile,
-      params: cloneEditParameters(presentRef.current),
+      params: cloneEditParameters(present.parameters),
       originalFileName: fileName,
+      maskTarget: present.maskTarget,
+      baseParameters: present.baseParameters
+        ? cloneEditParameters(present.baseParameters)
+        : null,
+      maskProvider: maskProviderRef.current,
+      mask: activeMask,
     };
 
     setExportStatus(null);
@@ -751,6 +898,7 @@ function App() {
               openRequestId={openRequestId}
               preparing={preparing && hasDocument}
               params={displayParams}
+              applyOptions={previewApplyOptions}
               onOpenImage={openImagePicker}
               comparing={showingBefore}
               onCanvasReady={handleCanvasReady}
@@ -762,7 +910,7 @@ function App() {
             params={params}
             imageAnalysis={imageAnalysis}
             disabled={controlsDisabled}
-            onApply={applyCommittedEdit}
+            onApply={applyAiEdit}
           />
         </div>
         <RightSidebar

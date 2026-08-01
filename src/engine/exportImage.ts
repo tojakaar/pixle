@@ -1,6 +1,9 @@
 import type { EditParameters } from "./EditParameters";
+import type { ApplyEditsOptions } from "./render";
 import { applyEdits, isIdentityEdit } from "./render";
 import { yieldToUi } from "./imageDecode";
+import type { Mask } from "./mask/types";
+import type { MaskProvider } from "./mask/MaskProvider";
 
 export type ExportFormat = "jpeg" | "png";
 
@@ -11,11 +14,24 @@ export interface ExportImageOptions {
   format: ExportFormat;
   /** JPEG quality 0–1; defaults to 0.95. */
   jpegQuality?: number;
+  /**
+   * Optional semantic local edit. Prefer `maskProvider` + `maskTarget` so export
+   * re-segments at full resolution (preview/export consistency). A precomputed
+   * `mask` is accepted as a fallback and will be resampled if needed.
+   */
+  maskTarget?: string | null;
+  baseParameters?: EditParameters | null;
+  maskProvider?: MaskProvider | null;
+  mask?: Mask | null;
 }
 
 /**
  * Decode `sourceFile` at its intrinsic resolution (no working-buffer downscale),
- * apply the current non-destructive edit parameters, and encode to JPG/PNG bytes.
+ * apply the current non-destructive edit parameters (optionally masked), and
+ * encode to JPG/PNG bytes.
+ *
+ * Preview and export share the same `applyEdits` engine. When a mask target is
+ * set, export re-runs the same MaskProvider on the full-res buffer.
  *
  * TODO: Preserve EXIF/XMP metadata from the source when practical. Canvas encode
  * strips metadata; copying EXIF into the output would need a dedicated metadata
@@ -24,16 +40,68 @@ export interface ExportImageOptions {
 export async function renderEditedImageBytes(
   options: ExportImageOptions,
 ): Promise<Uint8Array> {
-  const { sourceFile, params, format, jpegQuality = 0.95 } = options;
+  const {
+    sourceFile,
+    params,
+    format,
+    jpegQuality = 0.95,
+    maskTarget,
+    baseParameters,
+    maskProvider,
+    mask: providedMask,
+  } = options;
   const fullRes = await decodeFullResolutionImageData(sourceFile);
   await yieldToUi();
 
-  const edited = isIdentityEdit(params) ? fullRes : applyEdits(fullRes, params);
+  const applyOptions = await resolveExportMaskOptions({
+    image: fullRes,
+    maskTarget,
+    baseParameters,
+    maskProvider,
+    providedMask,
+  });
+  await yieldToUi();
+
+  const edited =
+    !applyOptions && isIdentityEdit(params)
+      ? fullRes
+      : applyEdits(fullRes, params, applyOptions);
   await yieldToUi();
 
   const mime = format === "png" ? "image/png" : "image/jpeg";
   const quality = format === "jpeg" ? jpegQuality : undefined;
   return encodeImageData(edited, mime, quality);
+}
+
+async function resolveExportMaskOptions(args: {
+  image: ImageData;
+  maskTarget?: string | null;
+  baseParameters?: EditParameters | null;
+  maskProvider?: MaskProvider | null;
+  providedMask?: Mask | null;
+}): Promise<ApplyEditsOptions | undefined> {
+  const target = args.maskTarget?.trim().toLowerCase();
+  if (!target) return undefined;
+
+  let mask = args.providedMask ?? null;
+  if (args.maskProvider) {
+    try {
+      const found = await args.maskProvider.findLabel(args.image, target);
+      if (found) mask = found;
+    } catch (error) {
+      console.warn("[pixle export] mask provider failed; trying fallback", error);
+    }
+  }
+
+  if (!mask) {
+    // No suitable object — export as a global edit (same params, no mask).
+    return undefined;
+  }
+
+  return {
+    mask,
+    baseParameters: args.baseParameters ?? undefined,
+  };
 }
 
 /** Build a sensible default export name, e.g. `vacation-edited.jpg`. */

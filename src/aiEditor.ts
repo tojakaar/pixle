@@ -2,25 +2,35 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   HSL_COLOR_NAMES,
   SCALAR_EDIT_KEYS,
+  SEMANTIC_TARGET_LABELS,
   clampHslChannel,
   clampScalarParam,
   createDefaultHsl,
+  isSemanticTargetLabel,
   shortenEditSummary,
   type EditParameters,
   type HslBand,
   type HslColorName,
   type ImageAnalysis,
   type ScalarEditParameterKey,
+  type SemanticTargetLabel,
 } from "./engine";
 
 /** Optional model note; never applied as an image parameter. */
 const EDIT_SUMMARY_KEY = "edit_summary";
+/** Optional semantic region label; never a bitmap / pixel payload. */
+const TARGET_KEY = "target";
 
 const HSL_CHANNELS: (keyof HslBand)[] = ["hue", "saturation", "luminance"];
 
 export interface EditFromPromptResult {
   /** Values applied to the non-destructive edit pipeline. */
   parameters: EditParameters;
+  /**
+   * Semantic region to edit locally, or null for a global edit.
+   * Gemini names the target only — segmentation happens locally via Segmenter.
+   */
+  target: SemanticTargetLabel | null;
   /** Short explanation from the model, if provided. */
   editSummary?: string;
 }
@@ -31,8 +41,8 @@ export interface EditFromPromptResult {
  * Calls the Tauri/Rust backend, which talks to an OpenAI-compatible API using
  * server-side environment variables. The API key never enters the frontend.
  * Image understanding is provided as compact local `ImageAnalysis` metadata —
- * never full-resolution pixels.
- * Only `parameters` are applied to the image; `editSummary` is explanatory.
+ * never full-resolution pixels. Gemini never segments or returns masks.
+ * Only `parameters` (+ optional `target` label) are applied to the image.
  */
 export async function editFromPrompt(
   prompt: string,
@@ -86,10 +96,29 @@ function parseHslBand(value: unknown, color: HslColorName): HslBand {
   return band;
 }
 
+function parseTarget(value: unknown): SemanticTargetLabel | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string") {
+    throw new Error("Field `target` must be a string or null when present.");
+  }
+  const normalized = value.trim().toLowerCase();
+  if (!normalized || normalized === "global" || normalized === "none") {
+    return null;
+  }
+  if (!isSemanticTargetLabel(normalized)) {
+    // Unknown labels are treated as global rather than rejecting the whole edit.
+    console.warn(
+      `[pixle ai] unsupported target "${value}"; applying as global edit. Known: ${SEMANTIC_TARGET_LABELS.join(", ")}`,
+    );
+    return null;
+  }
+  return normalized;
+}
+
 /**
  * Validate LLM/backend JSON before applying it to the UI.
- * Accepts the EditParameters schema plus optional `edit_summary`.
- * Rejects other unexpected fields (including image payloads).
+ * Accepts the EditParameters schema plus optional `edit_summary` and `target`.
+ * Rejects other unexpected fields (including image payloads / masks).
  */
 export function parseEditResponse(value: unknown): EditFromPromptResult {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -112,7 +141,8 @@ export function parseEditResponse(value: unknown): EditFromPromptResult {
     const allowed =
       SCALAR_EDIT_KEYS.includes(key as ScalarEditParameterKey) ||
       key === "hsl" ||
-      key === EDIT_SUMMARY_KEY;
+      key === EDIT_SUMMARY_KEY ||
+      key === TARGET_KEY;
     if (!allowed) {
       throw new Error(`Unexpected field \`${key}\` in EditParameters.`);
     }
@@ -161,7 +191,10 @@ export function parseEditResponse(value: unknown): EditFromPromptResult {
     }
   }
 
-  return { parameters, editSummary };
+  const target =
+    TARGET_KEY in record ? parseTarget(record[TARGET_KEY]) : null;
+
+  return { parameters, target, editSummary };
 }
 
 export function parseEditParameters(value: unknown): EditParameters {

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   applyEdits,
   isIdentityEdit,
+  type ApplyEditsOptions,
   type EditParameters,
 } from "../engine";
 import { openLog } from "../engine/openLog";
@@ -20,6 +21,8 @@ interface ImageViewportProps {
   /** True while decode/prepare is still running. */
   preparing?: boolean;
   params: EditParameters;
+  /** Optional semantic mask compositing (same engine as export). */
+  applyOptions?: ApplyEditsOptions;
   /** Opens the JPEG/PNG file picker from the empty state. */
   onOpenImage: () => void;
   /** True while the user is peeking at the untouched original. */
@@ -48,6 +51,7 @@ export function ImageViewport({
   openRequestId,
   preparing = false,
   params,
+  applyOptions,
   onOpenImage,
   comparing = false,
   onCanvasReady,
@@ -56,6 +60,7 @@ export function ImageViewport({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sourceRef = useRef<ImageData | null>(source);
   const paramsRef = useRef(params);
+  const applyOptionsRef = useRef(applyOptions);
   const openIdRef = useRef(openRequestId);
   const renderGenRef = useRef(0);
   const rafRef = useRef<number | null>(null);
@@ -74,6 +79,7 @@ export function ImageViewport({
 
   sourceRef.current = source;
   paramsRef.current = params;
+  applyOptionsRef.current = applyOptions;
   openIdRef.current = openRequestId;
   onCanvasReadyRef.current = onCanvasReady;
   onPlaceholderRetiredRef.current = onPlaceholderRetired;
@@ -154,6 +160,7 @@ export function ImageViewport({
 
       const current = sourceRef.current;
       const currentParams = paramsRef.current;
+      const currentApplyOptions = applyOptionsRef.current;
       if (!current) return;
 
       try {
@@ -169,9 +176,10 @@ export function ImageViewport({
         }
 
         const end = perfTime("viewport applyEdits+putImageData");
-        const frame = isIdentityEdit(currentParams)
-          ? current
-          : applyEdits(current, currentParams);
+        const frame =
+          !currentApplyOptions?.mask && isIdentityEdit(currentParams)
+            ? current
+            : applyEdits(current, currentParams, currentApplyOptions);
 
         if (gen !== renderGenRef.current || openIdRef.current !== boundOpenId) {
           openLog(boundOpenId, "skip stale putImageData");
@@ -235,7 +243,7 @@ export function ImageViewport({
       }
       renderGenRef.current += 1;
     };
-  }, [source, params, openRequestId]);
+  }, [source, params, applyOptions, openRequestId]);
 
   if (!source && !placeholderUrl && !placeholderLayer) {
     return (

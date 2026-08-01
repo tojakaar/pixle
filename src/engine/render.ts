@@ -8,8 +8,24 @@ import {
   DEFAULT_EDIT_PARAMETERS,
   HSL_COLOR_NAMES,
   cloneEditParameters,
+  parametersEqual,
 } from "./EditParameters";
+import { compositeMaskedEdit } from "./mask/composite";
+import type { Mask } from "./mask/types";
 import { perfTime } from "./perf";
+
+/**
+ * Optional semantic mask for local edits.
+ * The engine never inspects how the mask was produced — only its soft bitmap.
+ */
+export interface ApplyEditsOptions {
+  mask?: Mask;
+  /**
+   * Parameters for pixels outside the mask.
+   * Defaults to identity (original source) when omitted.
+   */
+  baseParameters?: EditParameters;
+}
 
 function clamp01(value: number): number {
   return value < 0 ? 0 : value > 1 ? 1 : value;
@@ -576,6 +592,11 @@ function needsSpatial(params: EditParameters): boolean {
 /**
  * Applies `params` to a copy of `source`. The original `ImageData` is never mutated.
  *
+ * When `options.mask` is provided, `params` apply only under the mask and
+ * `options.baseParameters` (default: identity) apply outside. Both sides use
+ * this same parameter engine — there is no second renderer. The engine never
+ * knows which Segmenter produced the mask.
+ *
  * Processing order:
  * 1. Exposure
  * 2. Contrast / gentle S-curve
@@ -594,6 +615,39 @@ function needsSpatial(params: EditParameters): boolean {
  * rAF-coalesced main-thread renders with generation tokens to drop stale work.
  */
 export function applyEdits(
+  source: ImageData,
+  params: EditParameters,
+  options?: ApplyEditsOptions,
+): ImageData {
+  const mask = options?.mask;
+  if (!mask) {
+    return applyEditsUnmasked(source, params);
+  }
+
+  const baseParams = options?.baseParameters ?? DEFAULT_EDIT_PARAMETERS;
+
+  // Identical grades → single pass (mask has no visible effect).
+  if (parametersEqual(params, baseParams)) {
+    return applyEditsUnmasked(source, params);
+  }
+
+  const end = perfTime(
+    `applyEdits masked ${source.width}x${source.height} (${mask.label})`,
+  );
+
+  const local = isIdentityEdit(params)
+    ? source
+    : applyEditsUnmasked(source, params);
+  const base = isIdentityEdit(baseParams)
+    ? source
+    : applyEditsUnmasked(source, baseParams);
+  const composited = compositeMaskedEdit(source, local, base, mask);
+  end();
+  return composited;
+}
+
+/** Core global parameter engine — model-agnostic, no masking. */
+function applyEditsUnmasked(
   source: ImageData,
   params: EditParameters,
 ): ImageData {

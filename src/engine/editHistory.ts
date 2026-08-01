@@ -1,27 +1,37 @@
-import type { EditParameters, HslAdjustments } from "./EditParameters";
+import type { EditParameters } from "./EditParameters";
 import {
   DEFAULT_EDIT_PARAMETERS,
-  HSL_COLOR_NAMES,
-  SCALAR_EDIT_KEYS,
   cloneEditParameters,
+  parametersEqual,
 } from "./EditParameters";
+import type { EditDocument } from "./EditDocument";
+import {
+  cloneEditDocument,
+  createGlobalEditDocument,
+  editDocumentsEqual,
+} from "./EditDocument";
 
 /**
- * Parameter-state history for non-destructive edits.
- * Stores EditParameters snapshots only — never full image buffers.
+ * Document-state history for non-destructive edits.
+ * Stores EditDocument snapshots (parameters + optional semantic mask target) —
+ * never full image buffers or mask bitmaps.
  */
 export interface EditHistoryState {
-  past: EditParameters[];
-  present: EditParameters;
-  future: EditParameters[];
+  past: EditDocument[];
+  present: EditDocument;
+  future: EditDocument[];
 }
 
 export function createEditHistory(
-  present: EditParameters = cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
+  present: EditParameters | EditDocument = createGlobalEditDocument(),
 ): EditHistoryState {
+  const doc =
+    "maskTarget" in present && "parameters" in present
+      ? cloneEditDocument(present)
+      : createGlobalEditDocument(present);
   return {
     past: [],
-    present: cloneEditParameters(present),
+    present: doc,
     future: [],
   };
 }
@@ -34,14 +44,18 @@ export function canRedo(history: EditHistoryState): boolean {
   return history.future.length > 0;
 }
 
-/** Push a new present state after a successful edit (clears redo). */
+/** Push a new present document after a successful edit (clears redo). */
 export function commitEdit(
   history: EditHistoryState,
-  next: EditParameters,
+  next: EditParameters | EditDocument,
 ): EditHistoryState {
+  const doc =
+    "maskTarget" in next && "parameters" in next
+      ? cloneEditDocument(next)
+      : createGlobalEditDocument(next);
   return {
-    past: [...history.past, cloneEditParameters(history.present)],
-    present: cloneEditParameters(next),
+    past: [...history.past, cloneEditDocument(history.present)],
+    present: doc,
     future: [],
   };
 }
@@ -51,8 +65,8 @@ export function undoEdit(history: EditHistoryState): EditHistoryState {
   const previous = history.past[history.past.length - 1]!;
   return {
     past: history.past.slice(0, -1),
-    present: cloneEditParameters(previous),
-    future: [cloneEditParameters(history.present), ...history.future],
+    present: cloneEditDocument(previous),
+    future: [cloneEditDocument(history.present), ...history.future],
   };
 }
 
@@ -60,39 +74,21 @@ export function redoEdit(history: EditHistoryState): EditHistoryState {
   if (history.future.length === 0) return history;
   const next = history.future[0]!;
   return {
-    past: [...history.past, cloneEditParameters(history.present)],
-    present: cloneEditParameters(next),
+    past: [...history.past, cloneEditDocument(history.present)],
+    present: cloneEditDocument(next),
     future: history.future.slice(1),
   };
 }
 
 /** Reset to identity parameters, recording a history step when not already identity. */
 export function resetEdit(history: EditHistoryState): EditHistoryState {
-  const identity = cloneEditParameters(DEFAULT_EDIT_PARAMETERS);
-  if (parametersEqual(history.present, identity)) {
+  const identity = createGlobalEditDocument(
+    cloneEditParameters(DEFAULT_EDIT_PARAMETERS),
+  );
+  if (editDocumentsEqual(history.present, identity)) {
     return history;
   }
   return commitEdit(history, identity);
 }
 
-function hslEqual(a: HslAdjustments, b: HslAdjustments): boolean {
-  for (const name of HSL_COLOR_NAMES) {
-    const aa = a[name];
-    const bb = b[name];
-    if (
-      aa.hue !== bb.hue ||
-      aa.saturation !== bb.saturation ||
-      aa.luminance !== bb.luminance
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
-
-export function parametersEqual(a: EditParameters, b: EditParameters): boolean {
-  for (const key of SCALAR_EDIT_KEYS) {
-    if (a[key] !== b[key]) return false;
-  }
-  return hslEqual(a.hsl, b.hsl);
-}
+export { parametersEqual, editDocumentsEqual };
