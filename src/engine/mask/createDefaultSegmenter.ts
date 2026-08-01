@@ -1,14 +1,18 @@
 import type { Segmenter } from "./Segmenter";
+import { createSegformerSegmenter } from "./providers/segformerSegmenter";
 import { createSkyHeuristicSegmenter } from "./providers/skyHeuristicSegmenter";
 import { createStubSegmenter } from "./providers/stubSegmenter";
 
-export type SegmenterKind = "sky-heuristic" | "stub";
+export type SegmenterKind = "segformer" | "sky-heuristic" | "stub";
 
 /**
  * Resolve the active Segmenter.
  *
- * Default: classical sky heuristic (proves one end-to-end object).
- * Set `VITE_PIXLE_SEGMENTER=stub` to force the empty stub provider.
+ * Default: SegFormer-B0 ADE20K (local ONNX via Transformers.js).
+ * Overrides:
+ *   VITE_PIXLE_SEGMENTER=stub
+ *   VITE_PIXLE_SEGMENTER=sky-heuristic
+ *   VITE_PIXLE_SEGMENTER=segformer
  */
 export function createDefaultSegmenter(
   kind: SegmenterKind = resolveSegmenterKind(),
@@ -17,19 +21,24 @@ export function createDefaultSegmenter(
     case "stub":
       return createStubSegmenter();
     case "sky-heuristic":
-    default:
       return createSkyHeuristicSegmenter();
+    case "segformer":
+    default:
+      return createSegformerSegmenter();
   }
 }
 
 function resolveSegmenterKind(): SegmenterKind {
   try {
     const env = import.meta.env?.VITE_PIXLE_SEGMENTER;
-    if (typeof env === "string" && env.trim().toLowerCase() === "stub") {
-      return "stub";
+    if (typeof env === "string") {
+      const value = env.trim().toLowerCase();
+      if (value === "stub") return "stub";
+      if (value === "sky-heuristic" || value === "sky") return "sky-heuristic";
+      if (value === "segformer") return "segformer";
     }
   } catch {
-    // Non-Vite contexts (tests) fall through to the default.
+    // Non-Vite contexts fall through to the default.
   }
-  return "sky-heuristic";
+  return "segformer";
 }

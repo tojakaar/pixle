@@ -15,9 +15,9 @@ export interface ExportImageOptions {
   /** JPEG quality 0–1; defaults to 0.95. */
   jpegQuality?: number;
   /**
-   * Optional semantic local edit. Prefer `maskProvider` + `maskTarget` so export
-   * re-segments at full resolution (preview/export consistency). A precomputed
-   * `mask` is accepted as a fallback and will be resampled if needed.
+   * Optional semantic local edit. Export prefers the session-cached mask from
+   * `maskProvider` (resampled to full-res) so preview and export stay consistent
+   * without re-running the Segmenter. A precomputed `mask` is a fallback.
    */
   maskTarget?: string | null;
   baseParameters?: EditParameters | null;
@@ -30,8 +30,8 @@ export interface ExportImageOptions {
  * apply the current non-destructive edit parameters (optionally masked), and
  * encode to JPG/PNG bytes.
  *
- * Preview and export share the same `applyEdits` engine. When a mask target is
- * set, export re-runs the same MaskProvider on the full-res buffer.
+ * Preview and export share the same `applyEdits` engine and the same cached
+ * MaskCollection (export resamples — it does not re-infer).
  *
  * TODO: Preserve EXIF/XMP metadata from the source when practical. Canvas encode
  * strips metadata; copying EXIF into the output would need a dedicated metadata
@@ -53,7 +53,7 @@ export async function renderEditedImageBytes(
   const fullRes = await decodeFullResolutionImageData(sourceFile);
   await yieldToUi();
 
-  const applyOptions = await resolveExportMaskOptions({
+  const applyOptions = resolveExportMaskOptions({
     image: fullRes,
     maskTarget,
     baseParameters,
@@ -73,28 +73,36 @@ export async function renderEditedImageBytes(
   return encodeImageData(edited, mime, quality);
 }
 
-async function resolveExportMaskOptions(args: {
+function resolveExportMaskOptions(args: {
   image: ImageData;
   maskTarget?: string | null;
   baseParameters?: EditParameters | null;
   maskProvider?: MaskProvider | null;
   providedMask?: Mask | null;
-}): Promise<ApplyEditsOptions | undefined> {
+}): ApplyEditsOptions | undefined {
   const target = args.maskTarget?.trim().toLowerCase();
   if (!target) return undefined;
 
-  let mask = args.providedMask ?? null;
+  // Prefer session cache resampled to export resolution (no second inference).
+  let mask: Mask | null = null;
   if (args.maskProvider) {
     try {
-      const found = await args.maskProvider.findLabel(args.image, target);
-      if (found) mask = found;
+      mask = args.maskProvider.getCachedLabel(
+        target,
+        args.image.width,
+        args.image.height,
+      );
     } catch (error) {
-      console.warn("[pixle export] mask provider failed; trying fallback", error);
+      console.warn("[pixle export] cached mask lookup failed", error);
     }
   }
 
+  if (!mask && args.providedMask) {
+    mask = args.providedMask;
+  }
+
   if (!mask) {
-    // No suitable object — export as a global edit (same params, no mask).
+    // Cache miss / no object — export as a global edit (never block).
     return undefined;
   }
 

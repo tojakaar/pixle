@@ -213,11 +213,13 @@ Examples of intent → parameters:
 
 Optional:
 - target: semantic region label for a LOCAL edit, or null / "global" for a whole-image edit.
-  Allowed labels: sky, person, face, skin, hair, eyes, clouds, mountains, water, trees, grass, road, buildings, food, cup, flowers, animals, cars, foreground, background.
-  Use a target ONLY when the user clearly asks to change one region (e.g. "darken the sky", "brighten my face", "mute the trees").
+  Preferred high-quality labels (best local masks): sky, person, vegetation, water, buildings, ground, background.
+  Also accepted: face, skin, hair, eyes, clouds, mountains, trees, grass, road, food, cup, flowers, animals, cars, foreground
+    (Pixle maps these to the nearest implemented region, e.g. trees→vegetation, face→person, mountains→ground).
+  Use a target ONLY when the user clearly asks to change one region (e.g. "darken the sky", "warm the person", "cool the water", "mute the trees").
   For global looks ("cinematic", "warm sunset", "recover highlights", "add grain") set target to null.
   You only NAME the target — Pixle's local Segmenter produces the mask. Never invent pixel regions.
-  Prefer "sky" when the user mentions sky / clouds-in-sky. Prefer null when unsure.
+  Prefer sky / person / vegetation / water / buildings / ground / background when they fit. Prefer null when unsure.
 - edit_summary: a short glance phrase for the UI (about 3–7 words, roughly ≤45 characters). Not a full sentence. Never start with "Applied". No trailing ellipsis. Examples: "Warm Kodak Gold", "Muted greens", "Soft summer film", "Fine monochrome grain", "Darker sky", "Warm skin, cool shadows". Explanatory only — never applied to pixels. Detailed rationale belongs nowhere in the JSON.
 
 Do not return any other keys (no image data, masks, histograms, analysis fields, presets, or reasoning fields).
@@ -810,10 +812,10 @@ fn parse_edit_response(value: &Value) -> Result<EditFromPromptResult, String> {
     })
 }
 
-const SEMANTIC_TARGETS: [&str; 20] = [
-    "sky", "person", "face", "skin", "hair", "eyes", "clouds", "mountains",
-    "water", "trees", "grass", "road", "buildings", "food", "cup", "flowers",
-    "animals", "cars", "foreground", "background",
+const SEMANTIC_TARGETS: [&str; 22] = [
+    "sky", "person", "vegetation", "water", "buildings", "ground", "background",
+    "face", "skin", "hair", "eyes", "clouds", "mountains", "trees", "grass",
+    "road", "food", "cup", "flowers", "animals", "cars", "foreground",
 ];
 
 /// Parse optional `target`. Unknown / global labels become None (global edit).
