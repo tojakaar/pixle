@@ -1,6 +1,8 @@
 mod ai_editor;
+mod photos;
 
 use ai_editor::edit_from_prompt;
+use photos::save_image_to_photos;
 use std::path::{Path, PathBuf};
 
 fn load_env_files() {
@@ -53,7 +55,11 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .invoke_handler(tauri::generate_handler![edit_from_prompt, save_image_file])
+        .invoke_handler(tauri::generate_handler![
+            edit_from_prompt,
+            save_image_file,
+            save_image_to_photos
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

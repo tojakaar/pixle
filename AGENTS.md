@@ -2,10 +2,12 @@
 
 ## Project overview
 
-`pixle` is a cross-platform desktop application built with **Tauri v2 + React 19 + TypeScript** (Vite bundler, Rust backend). See `README.md` for the full stack, project layout, prerequisites, and the complete list of commands.
+`pixle` is a cross-platform photo editor built with **Tauri v2 + React 19 + TypeScript** (Vite bundler, Rust backend). See `README.md` for the full stack, project layout, prerequisites, and the complete list of commands.
 
 - Frontend: `src/` (React + TypeScript, entry `src/main.tsx`)
+- Platform adapters: `src/platform/` (`ImagePicker`, `ImageExporter`, `ApiClient`)
 - Backend: `src-tauri/` (Rust; Tauri commands live in `src-tauri/src/lib.rs`)
+- iOS spike docs: `docs/ios-feasibility-spike.md`
 
 ## Cursor Cloud specific instructions
 
@@ -19,4 +21,6 @@ These are durable, non-obvious caveats for running this project in the cloud VM.
 - **AI image context:** On open, the frontend runs local analysis (`src/engine/imageAnalysis.ts`) on a downscaled copy and sends compact metadata (histogram, colour temperature, dominant colours, clipping, dimensions, faces when `FaceDetector` exists) with the prompt. Full-resolution pixels are never sent to the LLM.
 - **Large photos on macOS:** Images are decoded into a working buffer capped at 1600px on the long edge (`src/engine/imageDecode.ts`) using header probe + resized `createImageBitmap`, so WKWebView does not freeze on multi‑megapixel camera JPEGs. Opening clears as soon as pixels are ready; analysis runs afterward.
 - **First Rust build is slow:** The initial `cargo build` / `tauri dev` compiles the whole Tauri dependency tree (~1 min) and is cached under `src-tauri/target/` afterward.
-- **Lint/type-check:** Frontend type-checking is `npx tsc --noEmit` (also part of `npm run build`). Rust linting is `cargo clippy` and `cargo fmt --check` from `src-tauri/`. There is no ESLint config and no automated test suite in this scaffold yet.
+- **Lint/type-check:** Frontend type-checking is `npx tsc --noEmit` (also part of `npm run build`). Rust linting is `cargo clippy` and `cargo fmt --check` from `src-tauri/`. There is no ESLint config. Lightweight JS smokes: `npm run test:js`.
+- **iOS spike on Linux VMs:** `npx tauri ios` is unavailable (CLI has `android` only). Scaffolding (`Info.ios.plist`, `tauri.ios.conf.json`, `ios-bridge/`, platform adapters) is in-repo; real `ios init` / simulator / device runs require macOS + Xcode. Never present simulator results as device proof. Do not commit Gemini keys; production mobile needs a backend proxy.
+- **iOS Photos linker symbol:** Rust references `pixle_save_image_to_photos`; Swift exports it with `@_cdecl`. After `tauri ios init`, run `npm run ios:sync-bridge` (or `npm run ios:dev`) so `PhotosBridge.swift` is a member of `pixle_iOS`. Custom template: `src-tauri/ios-project.yml`. Do not stub the extern to silence linker errors.

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "com.pixle.app",
+  "bundle": {
+    "iOS": {
+      "developmentTeam": "",
+      "minimumSystemVersion": "14.0",
+      "template": "./ios-project.yml",
+      "frameworks": ["Photos"]
+    }
+  },
+  "app": {
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {}
+}
