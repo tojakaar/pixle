@@ -2,14 +2,18 @@
 /**
  * Ensure the Photos Swift bridge is compiled into the Tauri iOS app target.
  *
- * Cause of the linker error `_pixle_save_image_to_photos` not found:
- *   Rust `extern "C"` references the symbol, but PhotosBridge.swift lived only
- *   under src-tauri/ios-bridge/ and was never a member of pixle_iOS.
+ * Two link stages matter for `_pixle_save_image_to_photos`:
  *
- * This script:
- *   1. Copies PhotosBridge.swift into gen/apple/Sources/ (default Sources group)
- *   2. Patches gen/apple/project.yml to include ../../ios-bridge + Photos.framework
- *   3. Regenerates the Xcode project with xcodegen when available
+ * 1. Rust/cargo (Xcode "Build Rust Code"): cdylib link needs the symbol allowed
+ *    as undefined until the app links — handled in `src-tauri/build.rs`.
+ * 2. Final app link: PhotosBridge.swift must be a Compile Sources member of
+ *    `pixle_iOS` so the real `@_cdecl` export is present.
+ *
+ * This script handles (2):
+ *   - Patches gen/apple/project.yml to include ../../ios-bridge + Photos.framework
+ *   - Regenerates the Xcode project with xcodegen
+ *   - Copies PhotosBridge.swift into Sources/ only as a fallback when the
+ *     ios-bridge path cannot be added (avoids compiling the file twice)
  *
  * Safe to re-run. No-op (exit 0) when gen/apple is missing (e.g. Linux CI).
  */
@@ -20,6 +24,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
@@ -52,15 +57,15 @@ if (!existsSync(appleDir)) {
   process.exit(0);
 }
 
-mkdirSync(sourcesDir, { recursive: true });
-copyFileSync(bridgeSrc, bridgeDest);
-console.log(`[ios-bridge] synced → ${path.relative(root, bridgeDest)}`);
+let hasIosBridgeSource = false;
 
 if (existsSync(projectYml)) {
   let yml = readFileSync(projectYml, "utf8");
   let changed = false;
+  hasIosBridgeSource =
+    yml.includes("ios-bridge") || yml.includes("PixleBridge");
 
-  if (!yml.includes("ios-bridge") && !yml.includes("PixleBridge")) {
+  if (!hasIosBridgeSource) {
     // Insert after the first "- path: Sources" under the iOS target sources list.
     const marker = "    sources:\n      - path: Sources\n";
     const insertion =
@@ -72,11 +77,13 @@ if (existsSync(projectYml)) {
     if (yml.includes(marker)) {
       yml = yml.replace(marker, insertion);
       changed = true;
+      hasIosBridgeSource = true;
       console.log("[ios-bridge] patched project.yml sources → ../../ios-bridge");
     } else {
       console.warn(
         "[ios-bridge] could not locate Sources entry in project.yml; " +
-          "re-run `npx tauri ios init` so the custom template applies.",
+          "will copy into Sources/ as fallback. Prefer re-running `npx tauri ios init` " +
+          "so src-tauri/ios-project.yml applies.",
       );
     }
   } else {
@@ -86,12 +93,11 @@ if (existsSync(projectYml)) {
   if (!yml.includes("Photos.framework")) {
     const uiKit = "      - sdk: UIKit.framework\n";
     if (yml.includes(uiKit)) {
-      yml = yml.replace(
-        uiKit,
-        `${uiKit}      - sdk: Photos.framework\n`,
-      );
+      yml = yml.replace(uiKit, `${uiKit}      - sdk: Photos.framework\n`);
       changed = true;
-      console.log("[ios-bridge] patched project.yml dependencies → Photos.framework");
+      console.log(
+        "[ios-bridge] patched project.yml dependencies → Photos.framework",
+      );
     }
   }
 
@@ -100,6 +106,22 @@ if (existsSync(projectYml)) {
   }
 } else {
   console.warn("[ios-bridge] project.yml missing — run `npx tauri ios init`");
+}
+
+// Prefer a single Compile Sources membership via ../../ios-bridge. Copying into
+// Sources/ as well would compile the same @_cdecl twice (duplicate symbol).
+if (!hasIosBridgeSource) {
+  mkdirSync(sourcesDir, { recursive: true });
+  copyFileSync(bridgeSrc, bridgeDest);
+  console.log(
+    `[ios-bridge] fallback copy → ${path.relative(root, bridgeDest)}`,
+  );
+} else if (existsSync(bridgeDest)) {
+  // Remove a stale Sources copy left by older sync runs to avoid duplicates.
+  unlinkSync(bridgeDest);
+  console.log(
+    "[ios-bridge] removed stale Sources/PhotosBridge.swift (using ../../ios-bridge)",
+  );
 }
 
 function haveXcodegen() {
@@ -119,9 +141,8 @@ if (haveXcodegen() && existsSync(projectYml)) {
   });
   console.log("[ios-bridge] xcodegen complete");
 } else if (!haveXcodegen()) {
-  // Sources copy alone is not enough: XcodeGen writes an explicit file list into
-  // the pbxproj. Without regenerate, Compile Sources still omits PhotosBridge.swift
-  // and the linker reports undefined _pixle_save_image_to_photos.
+  // Without regenerate, Compile Sources may still omit PhotosBridge.swift
+  // and the final app linker reports undefined _pixle_save_image_to_photos.
   console.error(
     "[ios-bridge] xcodegen not on PATH. Install it (brew install xcodegen) and re-run\n" +
       "  npm run ios:sync-bridge\n" +

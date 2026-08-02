@@ -5,7 +5,8 @@
 //!
 //! The Swift file lives at `ios-bridge/PhotosBridge.swift` and is compiled into
 //! the `pixle_iOS` target via `ios-project.yml` (+ `npm run ios:sync-bridge`).
-//! See `ios-bridge/README.md`.
+//! The iOS cdylib link allows this symbol as undefined in `build.rs` until the
+//! final app link; see `docs/ios-linker-fix.md` and `ios-bridge/README.md`.
 
 use serde::Serialize;
 
@@ -60,8 +61,11 @@ mod ios {
 
     extern "C" {
         /// Implemented in `ios-bridge/PhotosBridge.swift` with
-        /// `@_cdecl("pixle_save_image_to_photos")`. Must be linked via the
-        /// `pixle_iOS` Xcode target (see `npm run ios:sync-bridge`).
+        /// `@_cdecl("pixle_save_image_to_photos")`.
+        ///
+        /// Linked at final app link via the `pixle_iOS` Xcode target
+        /// (`npm run ios:sync-bridge`). The iOS cdylib pass allows this symbol
+        /// as undefined in `build.rs` (`-Wl,-U,_pixle_save_image_to_photos`).
         fn pixle_save_image_to_photos(
             bytes: *const u8,
             len: usize,

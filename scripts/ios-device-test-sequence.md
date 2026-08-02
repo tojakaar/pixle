@@ -18,7 +18,7 @@ Run on **macOS + Xcode**. Do not treat simulator timings as device proof.
 ```bash
 npm install
 npx tauri ios init          # first time only, macOS
-npm run ios:sync-bridge     # required — fixes undefined _pixle_save_image_to_photos
+npm run ios:sync-bridge     # required — PhotosBridge.swift in pixle_iOS (see docs/ios-linker-fix.md)
 npm run ios:dev             # or: npx tauri ios dev --device
 ```
 
