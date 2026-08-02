@@ -78,9 +78,9 @@ npm run ios:dev            # sync + tauri ios dev
 npx tauri ios dev --device
 ```
 
-If linking fails with `Undefined symbols: _pixle_save_image_to_photos`, the Swift
-bridge is missing from the Xcode target — run `npm run ios:sync-bridge` and rebuild.
-See `src-tauri/ios-bridge/README.md`.
+If linking fails with `Undefined symbols: _pixle_save_image_to_photos`, see
+`docs/ios-linker-fix.md` (cargo cdylib allow-list in `build.rs` + Swift target
+membership via `npm run ios:sync-bridge`). Do not stub the Photos bridge.
 
 Full prerequisites, device test sequence, and blockers: [`docs/ios-feasibility-spike.md`](docs/ios-feasibility-spike.md).
 
