@@ -4,7 +4,9 @@
   "bundle": {
     "iOS": {
       "developmentTeam": "",
-      "minimumSystemVersion": "14.0"
+      "minimumSystemVersion": "14.0",
+      "template": "./ios-project.yml",
+      "frameworks": ["Photos"]
     }
   },
   "app": {

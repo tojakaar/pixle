@@ -1,9 +1,11 @@
 //! Photos library save adapter for the iOS feasibility spike.
 //!
 //! - Desktop / non-iOS: stub that returns a clear error (desktop uses dialog+fs).
-//! - iOS: calls `PixlePhotosBridge` (Swift) registered after `tauri ios init`.
+//! - iOS: calls the Swift `@_cdecl("pixle_save_image_to_photos")` export.
 //!
-//! See `ios-bridge/PhotosBridge.swift` and `docs/ios-feasibility-spike.md`.
+//! The Swift file lives at `ios-bridge/PhotosBridge.swift` and is compiled into
+//! the `pixle_iOS` target via `ios-project.yml` (+ `npm run ios:sync-bridge`).
+//! See `ios-bridge/README.md`.
 
 use serde::Serialize;
 
@@ -57,8 +59,9 @@ mod ios {
     use std::os::raw::c_char;
 
     extern "C" {
-        /// Implemented in `ios-bridge/PhotosBridge.swift` (copied into the
-        /// Xcode Sources folder after `npm run tauri ios init`).
+        /// Implemented in `ios-bridge/PhotosBridge.swift` with
+        /// `@_cdecl("pixle_save_image_to_photos")`. Must be linked via the
+        /// `pixle_iOS` Xcode target (see `npm run ios:sync-bridge`).
         fn pixle_save_image_to_photos(
             bytes: *const u8,
             len: usize,

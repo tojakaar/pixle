@@ -2,17 +2,15 @@ import Foundation
 import Photos
 import UIKit
 
-/// Minimal Swift bridge for the Pixle iOS feasibility spike.
+/// Native Photos write bridge for the Pixle iOS spike.
 ///
-/// After `npx tauri ios init` on macOS, copy this file into:
-///   src-tauri/gen/apple/Sources/pixle/
-/// (or the Sources group shown in the generated Xcode project) and ensure it
-/// is a member of the iOS app target. The Rust command `save_image_to_photos`
-/// calls `pixle_save_image_to_photos` below.
+/// Linked into the `pixle_iOS` Xcode target via:
+///   - `src-tauri/ios-project.yml` (source path `../../ios-bridge`)
+///   - `scripts/sync-ios-photos-bridge.mjs` (also copies into `gen/apple/Sources/`)
 ///
-/// Permissions (Info.ios.plist):
-///   NSPhotoLibraryAddUsageDescription — required to write
-///   NSPhotoLibraryUsageDescription — optional read (picker uses PHPicker)
+/// Rust (`src-tauri/src/photos.rs`) declares:
+///   `extern "C" fn pixle_save_image_to_photos(...) -> i32`
+/// The `@_cdecl` name below MUST match that symbol exactly.
 
 @_cdecl("pixle_save_image_to_photos")
 public func pixle_save_image_to_photos(
@@ -26,11 +24,14 @@ public func pixle_save_image_to_photos(
 ) -> Int32 {
   func writeError(_ message: String) {
     guard let errBuf, errBufLen > 1 else { return }
-    let data = Array(message.utf8CString.prefix(errBufLen))
-    for (i, byte) in data.enumerated() {
+    let cString = Array(message.utf8CString.prefix(errBufLen))
+    for (i, byte) in cString.enumerated() {
       errBuf[i] = byte
     }
   }
+
+  // `format` is reserved for future HEIC/PNG branching; JPEG/PNG both decode via UIImage.
+  _ = format
 
   guard let bytes, len > 0 else {
     writeError("Empty image payload.")
@@ -51,21 +52,44 @@ public func pixle_save_image_to_photos(
   let sema = DispatchSemaphore(value: 0)
   var saveError: String?
 
-  PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-    guard status == .authorized || status == .limited else {
-      saveError = "Photos permission denied. Enable Photos access for Pixle in Settings."
-      sema.signal()
-      return
-    }
-
-    PHPhotoLibrary.shared().performChanges({
-      PHAssetChangeRequest.creationRequestForAsset(from: image)
-    }, completionHandler: { success, error in
-      if !success {
-        saveError = error?.localizedDescription ?? "Photos save failed."
+  // Photos APIs must be used from a context that can present the permission UI.
+  // performChanges callbacks may arrive off-main; the semaphore bridges back to Rust.
+  if #available(iOS 14, *) {
+    PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+      guard status == .authorized || status == .limited else {
+        saveError =
+          "Photos permission denied. Enable Photos access for Pixle in Settings."
+        sema.signal()
+        return
       }
-      sema.signal()
-    })
+
+      PHPhotoLibrary.shared().performChanges({
+        PHAssetChangeRequest.creationRequestForAsset(from: image)
+      }, completionHandler: { success, error in
+        if !success {
+          saveError = error?.localizedDescription ?? "Photos save failed."
+        }
+        sema.signal()
+      })
+    }
+  } else {
+    PHPhotoLibrary.requestAuthorization { status in
+      guard status == .authorized else {
+        saveError =
+          "Photos permission denied. Enable Photos access for Pixle in Settings."
+        sema.signal()
+        return
+      }
+
+      PHPhotoLibrary.shared().performChanges({
+        PHAssetChangeRequest.creationRequestForAsset(from: image)
+      }, completionHandler: { success, error in
+        if !success {
+          saveError = error?.localizedDescription ?? "Photos save failed."
+        }
+        sema.signal()
+      })
+    }
   }
 
   let waitResult = sema.wait(timeout: .now() + 60)

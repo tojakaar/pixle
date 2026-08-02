@@ -11,15 +11,15 @@ Run on **macOS + Xcode**. Do not treat simulator timings as device proof.
 - [ ] `.env` with `GEMINI_API_KEY` for local device AI only (never ship in release)
 - [ ] `npm install`
 - [ ] `npx tauri ios init` (once)
-- [ ] Copy `src-tauri/ios-bridge/PhotosBridge.swift` into generated Sources (see bridge README)
+- [ ] `npm run ios:sync-bridge` (includes PhotosBridge.swift in `pixle_iOS`)
 
 ## Build / run
 
 ```bash
 npm install
 npx tauri ios init          # first time only, macOS
-# wire PhotosBridge.swift
-npx tauri ios dev --device   # physical iPhone preferred
+npm run ios:sync-bridge     # required — fixes undefined _pixle_save_image_to_photos
+npm run ios:dev             # or: npx tauri ios dev --device
 ```
 
 ## Sequence

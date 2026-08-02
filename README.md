@@ -72,9 +72,15 @@ Requires macOS, Xcode, iOS SDK, Rust iOS targets, CocoaPods, and Apple signing. 
 
 ```bash
 npx tauri ios init
-cp src-tauri/ios-bridge/PhotosBridge.swift src-tauri/gen/apple/Sources/pixle/
+npm run ios:sync-bridge    # include PhotosBridge.swift in pixle_iOS target
+npm run ios:dev            # sync + tauri ios dev
+# physical device:
 npx tauri ios dev --device
 ```
+
+If linking fails with `Undefined symbols: _pixle_save_image_to_photos`, the Swift
+bridge is missing from the Xcode target — run `npm run ios:sync-bridge` and rebuild.
+See `src-tauri/ios-bridge/README.md`.
 
 Full prerequisites, device test sequence, and blockers: [`docs/ios-feasibility-spike.md`](docs/ios-feasibility-spike.md).
 

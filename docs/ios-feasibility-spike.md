@@ -54,11 +54,14 @@ sudo gem install cocoapods   # or: brew install cocoapods
 cd /path/to/pixle
 npm install
 npx tauri ios init
-cp src-tauri/ios-bridge/PhotosBridge.swift \
-  src-tauri/gen/apple/Sources/pixle/PhotosBridge.swift
+npm run ios:sync-bridge   # include PhotosBridge.swift in pixle_iOS (fixes undefined _pixle_save_image_to_photos)
 # Set development team in Xcode or tauri.ios.conf.json
-npx tauri ios dev --device
+npm run ios:dev           # or: npx tauri ios dev --device
 ```
+
+If the linker reports `Undefined symbols: _pixle_save_image_to_photos`, the Swift
+bridge is not in the Xcode target — run `npm run ios:sync-bridge` (see
+`src-tauri/ios-bridge/README.md`). Do not stub the Rust `extern "C"` to silence it.
 
 **Apple signing:** development team ID, unique bundle id `com.pixle.app`, device registered for debug. Release/App Store not in scope.
 
